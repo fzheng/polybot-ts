@@ -32,7 +32,7 @@ exit_before_expiry_minutes = 3    # Liquidate leg 1 if leg 2 not found with N mi
 
 [paper]
 enabled = true
-starting_balance = 1000.0
+starting_balance = 100.0
 simulate_fees = true
 simulate_slippage = true
 slippage_pct = 0.02

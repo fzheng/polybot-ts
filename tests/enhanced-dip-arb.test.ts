@@ -979,22 +979,22 @@ describe('EnhancedDipArbStrategy', () => {
       const strategy = new EnhancedDipArbStrategy(sdk, config);
       await strategy.start();
 
-      // Start market with only 2 minutes remaining (< 3 min threshold)
+      // Start market with 4 minutes remaining (> 3 min gate so leg1 can enter)
       emitStarted(sdk, {
-        endTime: new Date(Date.now() + 120 * 1000), // 2 min
+        endTime: new Date(Date.now() + 240 * 1000), // 4 min
       });
       populateOrderbook(sdk);
 
       const emergencyEvents = collectEvents(strategy, 'emergencyExit');
       const cycleEvents = collectEvents(strategy, 'cycleComplete');
 
-      // Process leg1
+      // Process leg1 — passes time gate (240s > 180s threshold)
       sdk.dipArb.emit('signal', makeLeg1Signal());
       await vi.advanceTimersByTimeAsync(0);
       expect(strategy.getState()).toBe(StrategyState.WAITING_FOR_HEDGE);
 
-      // Advance 2 seconds for emergency timer to fire
-      await vi.advanceTimersByTimeAsync(2000);
+      // Advance past the 3-min threshold (need 60s+ to cross from 240s to <180s)
+      await vi.advanceTimersByTimeAsync(61_000);
 
       expect(emergencyEvents).toHaveLength(1);
       expect(emergencyEvents[0].reason).toContain('Time exit');
@@ -1013,7 +1013,7 @@ describe('EnhancedDipArbStrategy', () => {
       await strategy.start();
 
       emitStarted(sdk, {
-        endTime: new Date(Date.now() + 60 * 1000), // 1 min only
+        endTime: new Date(Date.now() + 240 * 1000), // 4 min (> 3 min gate)
       });
       populateOrderbook(sdk);
 
@@ -1022,8 +1022,8 @@ describe('EnhancedDipArbStrategy', () => {
       sdk.dipArb.emit('signal', makeLeg1Signal());
       await vi.advanceTimersByTimeAsync(0);
 
-      // Even advancing past expiry shouldn't trigger emergency
-      await vi.advanceTimersByTimeAsync(5000);
+      // Even advancing past the 3-min threshold shouldn't trigger emergency
+      await vi.advanceTimersByTimeAsync(61_000);
       expect(emergencyEvents).toHaveLength(0);
       await strategy.stop();
     });
@@ -1035,7 +1035,7 @@ describe('EnhancedDipArbStrategy', () => {
       await strategy.start();
 
       emitStarted(sdk, {
-        endTime: new Date(Date.now() + 120 * 1000),
+        endTime: new Date(Date.now() + 240 * 1000), // 4 min (> 3 min gate)
       });
       populateOrderbook(sdk);
 
@@ -1045,8 +1045,8 @@ describe('EnhancedDipArbStrategy', () => {
       sdk.dipArb.emit('signal', makeLeg1Signal({ currentPrice: 0.40 }));
       await vi.advanceTimersByTimeAsync(0);
 
-      // Trigger emergency exit (time-based)
-      await vi.advanceTimersByTimeAsync(2000);
+      // Advance past the 3-min threshold to trigger emergency exit
+      await vi.advanceTimersByTimeAsync(61_000);
 
       const result = cycleEvents[0] as CycleResult;
       // P&L should be based on last market price, not -100%
@@ -1064,13 +1064,14 @@ describe('EnhancedDipArbStrategy', () => {
       await strategy.start();
 
       emitStarted(sdk, {
-        endTime: new Date(Date.now() + 120 * 1000),
+        endTime: new Date(Date.now() + 240 * 1000), // 4 min (> 3 min gate)
       });
       populateOrderbook(sdk);
 
       sdk.dipArb.emit('signal', makeLeg1Signal());
       await vi.advanceTimersByTimeAsync(0);
-      await vi.advanceTimersByTimeAsync(2000);
+      // Advance past 3-min threshold
+      await vi.advanceTimersByTimeAsync(61_000);
 
       const stats = strategy.getStats();
       expect(stats.emergencyExits).toBe(1);
@@ -1090,7 +1091,7 @@ describe('EnhancedDipArbStrategy', () => {
       for (let i = 0; i < 3; i++) {
         emitStarted(sdk, {
           slug: `round-${i}`,
-          endTime: new Date(Date.now() + 120 * 1000),
+          endTime: new Date(Date.now() + 600 * 1000), // 10 min (> 3 min gate)
         });
         populateOrderbook(sdk);
 
@@ -1284,18 +1285,17 @@ describe('EnhancedDipArbStrategy', () => {
     it('should not count losing cycle as won', async () => {
       const { sdk, strategy } = await setupReady();
 
-      // Losing cycle: leg1 $0.50 + leg2 $0.50 = $1.00 cost, $1 payout → 0 profit
-      // Actually need sum <= target. Let's use sum that's exactly 0.95
+      // Losing cycle: leg1 $0.50 + leg2 $0.55 = $1.05 cost, $1 payout → loss
       sdk.dipArb.emit('signal', makeLeg1Signal({ currentPrice: 0.50 }));
       await flush();
-      sdk.dipArb.emit('signal', makeLeg2Signal({ currentPrice: 0.45 })); // sum = 0.95
+      sdk.dipArb.emit('signal', makeLeg2Signal({ currentPrice: 0.55 }));
       await flush();
 
       const stats = strategy.getStats();
       // shares = floor(50/0.50) = 100 → capped at 100
-      // totalCost = 0.50*100 + 0.45*100 = 95
-      // profit = 100 - 95 = 5 → actually a win
-      expect(stats.cyclesWon).toBe(1);
+      // totalCost = 0.50*100 + 0.55*100 = 105
+      // profit = 100 - 105 = -5 → loss
+      expect(stats.cyclesWon).toBe(0);
       await strategy.stop();
     });
   });
@@ -1446,7 +1446,7 @@ describe('EnhancedDipArbStrategy', () => {
       const strategy = new EnhancedDipArbStrategy(sdk, config);
       await strategy.start();
       emitStarted(sdk, {
-        endTime: new Date(Date.now() + 120 * 1000), // 2 min only
+        endTime: new Date(Date.now() + 240 * 1000), // 4 min (> 3 min gate)
       });
       populateOrderbook(sdk);
 
@@ -1461,8 +1461,8 @@ describe('EnhancedDipArbStrategy', () => {
       // Clear previous calls
       sdk.tradingService.cancelOrder.mockClear();
 
-      // Emergency exit triggers
-      await vi.advanceTimersByTimeAsync(2000);
+      // Advance past 3-min threshold to trigger emergency exit
+      await vi.advanceTimersByTimeAsync(61_000);
 
       // Should cancel the leg1 exit sell order
       expect(sdk.tradingService.cancelOrder).toHaveBeenCalledWith('exit-sell-leg1');

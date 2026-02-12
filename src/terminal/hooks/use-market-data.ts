@@ -24,6 +24,7 @@ export function useMarketData(strategy: EnhancedDipArbStrategy): MarketData {
   const [downBid, setDownBid] = useState<OrderbookSide>({ price: null, size: 0 });
   const [currentMarket, setCurrentMarket] = useState<string | null>(null);
   const [secondsRemaining, setSecondsRemaining] = useState<number | null>(null);
+  const marketEndMsRef = useRef<number | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -39,15 +40,20 @@ export function useMarketData(strategy: EnhancedDipArbStrategy): MarketData {
 
     const handleNewRound = (data: { slug: string; secondsRemaining: number }) => {
       setCurrentMarket(data.slug);
+      // Compute market end time from the event so the countdown is always derived from Date.now()
+      marketEndMsRef.current = Date.now() + data.secondsRemaining * 1000;
       setSecondsRemaining(data.secondsRemaining);
     };
 
     strategy.on('priceUpdate', handlePrice);
     strategy.on('newRound', handleNewRound);
 
-    // Countdown timer
+    // Countdown timer — recompute from wall clock each tick so it never drifts
     timerRef.current = setInterval(() => {
-      setSecondsRemaining(prev => (prev != null && prev > 0 ? prev - 1 : prev));
+      if (marketEndMsRef.current != null) {
+        const secs = Math.max(0, Math.round((marketEndMsRef.current - Date.now()) / 1000));
+        setSecondsRemaining(secs);
+      }
     }, 1000);
 
     return () => {

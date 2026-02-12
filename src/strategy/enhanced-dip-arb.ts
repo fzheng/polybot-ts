@@ -79,6 +79,15 @@ export class EnhancedDipArbStrategy extends EventEmitter {
   private downBids: Array<{ price: number; size: number }> = [];
   private orderbookListener: ((book: any) => void) | null = null;
 
+  // Guards against displaying stale prices from previous market.
+  // SDK doesn't clear upAsks/downAsks on start(), so after rotation we'd
+  // read old prices until the first WebSocket orderbook snapshot arrives.
+  private marketDataReady = false;
+  private marketDataTimer: ReturnType<typeof setTimeout> | null = null;
+  private marketDataRetries = 0;
+  private currentUpTokenId: string | undefined;
+  private currentDownTokenId: string | undefined;
+
   // Time tracking for TUI
   private lastSecondsRemaining = 900;
 
@@ -119,7 +128,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       slidingWindowMs: this.config.trading.dumpWindowMs,
       windowMinutes: this.config.trading.windowMinutes,
       leg2TimeoutSeconds: 900, // We handle timeout ourselves via exitBeforeExpiryMinutes
-      enableSurge: true,
+      enableSurge: false, // Disabled: surge signals buy the opposite side at ceiling prices (e.g. UP@$0.97 when DOWN surges from $0.04→$0.05)
       autoMerge: true,
       autoExecute: false, // We control execution; explicit settlement in handleRoundComplete + autoSettle as fallback
       debug: false,
@@ -185,6 +194,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     this.clearFillPollTimer();
     this.stopPricePoll();
     this.unsubscribeOrderbookBids();
+    if (this.marketDataTimer) { clearTimeout(this.marketDataTimer); this.marketDataTimer = null; }
     // Cancel any outstanding exit sell orders on stop
     if (!this.config.paper.enabled) {
       for (const orderId of [this.leg1SellOrderId, this.leg2SellOrderId]) {
@@ -277,6 +287,15 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
     this.emit('newRound', { slug, secondsRemaining: remaining });
 
+    // Mark price data as stale until the first WebSocket orderbook event arrives.
+    // SDK doesn't clear upAsks/downAsks on start(), so we'd show old prices otherwise.
+    this.marketDataReady = false;
+    this.marketDataRetries = 0;
+    this.currentUpTokenId = event.upTokenId;
+    this.currentDownTokenId = event.downTokenId;
+    if (this.marketDataTimer) { clearTimeout(this.marketDataTimer); this.marketDataTimer = null; }
+    this.scheduleOrderbookRetry();
+
     // Subscribe to realtimeService orderbook events for bid data
     // Pass token IDs from the event directly to avoid race with SDK internal state
     this.subscribeOrderbookBids(event.upTokenId, event.downTokenId);
@@ -284,7 +303,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     // Start/restart continuous price polling
     this.startPricePoll();
 
-    this.log('info', `New market: ${slug} (${remaining}s remaining)`);
+    this.log('info', `New market: ${slug} — https://polymarket.com/event/${slug}`);
   }
 
   /**
@@ -299,12 +318,11 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     this.downHistory = [];
     this.expectedOrderIds.clear();
 
-    // Calculate seconds remaining from round end time
-    const endTimeMs = event.endTime instanceof Date
-      ? event.endTime.getTime()
-      : (typeof event.endTime === 'number' ? event.endTime : 0);
-    const remaining = endTimeMs > 0
-      ? Math.max(0, Math.round((endTimeMs - Date.now()) / 1000))
+    // Always derive remaining time from marketEndTimeMs (set in handleStarted).
+    // The SDK's newRound event may report a full-duration endTime that ignores
+    // how far into the market we actually are.
+    const remaining = this.marketEndTimeMs > 0
+      ? Math.max(0, Math.round((this.marketEndTimeMs - Date.now()) / 1000))
       : this.lastSecondsRemaining;
     this.lastSecondsRemaining = remaining;
 
@@ -359,13 +377,34 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       return; // Already entered (or exited) this market — no re-entry
     }
 
-    // ── Gate 2: Extract signal data ─────────────────────────────────
+    // ── Gate 2: Time remaining — don't enter near expiry ───────────
+    // The SDK's windowMinutes filter can misfire when joining a market
+    // mid-way. Our own marketEndTimeMs (from the started event) is the
+    // source of truth. Never enter if we'd immediately emergency exit.
+    {
+      const secsLeft = Math.max(0, Math.round((this.marketEndTimeMs - Date.now()) / 1000));
+      const minRequired = this.config.risk.exitBeforeExpiryMinutes * 60;
+      if (secsLeft <= minRequired) {
+        return; // Too close to expiry — logged silently to avoid spam
+      }
+    }
+
+    // ── Gate 3: Extract signal data ─────────────────────────────────
     const side: Side = signal.dipSide === 'UP' ? Side.UP : Side.DOWN;
     const currentPrice = new Decimal(signal.currentPrice);
     const oppositeAsk = new Decimal(signal.oppositeAsk);
     const dropPct = signal.dropPercent;
+    const signalSource: string = signal.source ?? 'dip'; // 'dip' | 'surge' | 'mispricing'
 
-    // ── Gate 3: Spread width check ─────────────────────────────────
+    // ── Gate 4: Reject non-dip signals ───────────────────────────
+    // Surge/mispricing signals can fire with absurd parameters (e.g. buy UP@$0.97
+    // because DOWN surged 25% from $0.04→$0.05). The dropPercent field is overloaded
+    // and doesn't represent an actual dip of the buying side.
+    if (signalSource !== 'dip') {
+      return;
+    }
+
+    // ── Gate 5: Spread width check ─────────────────────────────────
     // Uses our own orderbook subscription for bids + SDK's internal asks.
     // SDK signals don't carry bestBid/bestAsk, so we source them ourselves.
     {
@@ -388,14 +427,14 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       }
     }
 
-    // ── Gate 4: Circuit breaker ────────────────────────────────────
+    // ── Gate 6: Circuit breaker ────────────────────────────────────
     if (this.positionSizer.isTradingPaused()) {
       const reason = this.positionSizer.getPauseReason();
       this.log('warn', `CIRCUIT BREAKER: ${reason}`);
       return;
     }
 
-    // ── Gate 5: Position sizing ────────────────────────────────────
+    // ── Gate 7: Position sizing ────────────────────────────────────
     const shares = this.positionSizer.calculateShares(
       this.currentBalance,
       currentPrice.toNumber(),
@@ -405,7 +444,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       return;
     }
 
-    // ── Gate 6: Fee-aware order type ────────────────────────────────
+    // ── Gate 8: Fee-aware order type ────────────────────────────────
     const orderType = this.orderPlacer.decideLeg1OrderType(
       currentPrice.toNumber(),
       oppositeAsk.toNumber(),
@@ -414,8 +453,9 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
     this.log(
       'info',
-      `LEG 1 SIGNAL: ${side} dropped ${(dropPct * 100).toFixed(1)}% → ` +
+      `LEG 1 SIGNAL: ${side} dipped ${(dropPct * 100).toFixed(1)}% → ` +
       `price=$${currentPrice.toFixed(4)}, opposite=$${oppositeAsk.toFixed(4)}, ` +
+      `sum=$${currentPrice.plus(oppositeAsk).toFixed(4)}, ` +
       `shares=${shares} (${(this.config.risk.maxBalancePctPerTrade * 100).toFixed(0)}% of $${this.currentBalance.toFixed(0)}), ` +
       `order=${orderType}`,
     );
@@ -444,6 +484,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
         };
         this.leg1 = leg;
         this.setState(StrategyState.WAITING_FOR_HEDGE);
+        this.notifySdkLeg1Filled(leg);
         this.startEmergencyTimer();
         this.emit('leg1Executed', leg);
         this.log('info', `LEG 1 FILLED (paper): ${leg.shares} ${side} @ $${leg.price.toFixed(4)} [${orderType}]`);
@@ -579,6 +620,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       };
       this.leg1 = leg;
       this.setState(StrategyState.WAITING_FOR_HEDGE);
+      this.notifySdkLeg1Filled(leg);
       this.startEmergencyTimer();
       this.emit('leg1Executed', leg);
     }
@@ -761,6 +803,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       };
       this.leg1 = leg;
       this.setState(StrategyState.WAITING_FOR_HEDGE);
+      this.notifySdkLeg1Filled(leg);
       this.startEmergencyTimer();
       this.emit('leg1Executed', leg);
       await this.placeExitSell(leg, 1);
@@ -954,6 +997,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       };
       this.leg1 = legInfo;
       this.setState(StrategyState.WAITING_FOR_HEDGE);
+      this.notifySdkLeg1Filled(legInfo);
       this.startEmergencyTimer();
       this.emit('leg1Executed', legInfo);
       this.placeExitSell(legInfo, 1).catch(err => {
@@ -999,6 +1043,20 @@ export class EnhancedDipArbStrategy extends EventEmitter {
    * @param upId - UP token ID (pass from 'started' event to avoid stale dipArb.market)
    * @param downId - DOWN token ID
    */
+  private scheduleOrderbookRetry(): void {
+    this.marketDataTimer = setTimeout(() => {
+      if (this.marketDataReady) return;
+      this.marketDataRetries++;
+      if (this.marketDataRetries >= 3) {
+        this.log('warn', 'No orderbook data after 3 retries — price display may be stale');
+        return;
+      }
+      this.log('warn', `No orderbook data after ${this.marketDataRetries * 10}s — re-subscribing (attempt ${this.marketDataRetries + 1}/3)`);
+      this.subscribeOrderbookBids(this.currentUpTokenId, this.currentDownTokenId);
+      this.scheduleOrderbookRetry();
+    }, 10_000);
+  }
+
   private subscribeOrderbookBids(upId?: string, downId?: string): void {
     this.unsubscribeOrderbookBids();
 
@@ -1019,8 +1077,16 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       const tokenId = book.assetId ?? book.tokenId;
       if (tokenId === upTokenId && book.bids) {
         this.upBids = book.bids.map((l: any) => ({ price: Number(l.price), size: Number(l.size) }));
+        if (!this.marketDataReady) {
+          this.marketDataReady = true;
+          this.log('debug', 'Orderbook data ready for new market');
+        }
       } else if (tokenId === downTokenId && book.bids) {
         this.downBids = book.bids.map((l: any) => ({ price: Number(l.price), size: Number(l.size) }));
+        if (!this.marketDataReady) {
+          this.marketDataReady = true;
+          this.log('debug', 'Orderbook data ready for new market');
+        }
       }
     };
 
@@ -1055,6 +1121,11 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     this.pricePollTimer = setInterval(() => {
       const dipArb = this.sdk.dipArb as any;
       const now = Date.now();
+
+      // Don't emit stale prices from the previous market.
+      // After market rotation, SDK's upAsks/downAsks retain old data until
+      // the first WebSocket orderbook snapshot arrives for the new tokens.
+      if (!this.marketDataReady) return;
 
       // Read asks from SDK (primary: priceHistory, fallback: upAsks/downAsks)
       const sdkHistory = dipArb.priceHistory as Array<{ timestamp: number; upAsk: number; downAsk: number }> | undefined;
@@ -1320,6 +1391,32 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     const cutoff = now - 5 * 60 * 1000; // 5 minutes
     this.upHistory = this.upHistory.filter(p => p.timestamp >= cutoff);
     this.downHistory = this.downHistory.filter(p => p.timestamp >= cutoff);
+  }
+
+  // ── SDK State Sync ──────────────────────────────────────────────────
+
+  /**
+   * Advance the SDK's internal round phase to 'leg1_filled'.
+   *
+   * With autoExecute: false the SDK emits leg1 signals but never
+   * transitions its own state machine — detectSignal() keeps calling
+   * detectLeg1Signal() instead of detectLeg2Signal(). Manually setting
+   * currentRound.phase tells the SDK we filled leg1 so it starts
+   * emitting leg2 hedge signals.
+   */
+  private notifySdkLeg1Filled(leg: LegInfo): void {
+    const dipArb = this.sdk.dipArb as any;
+    if (!dipArb.currentRound) return;
+
+    dipArb.currentRound.phase = 'leg1_filled';
+    dipArb.currentRound.leg1 = {
+      side: leg.side === Side.UP ? 'UP' : 'DOWN',
+      price: leg.price.toNumber(),
+      shares: leg.shares.toNumber(),
+      timestamp: Date.now(),
+      tokenId: leg.tokenId,
+    };
+    this.log('debug', 'SDK notified: leg1 filled, now looking for leg2');
   }
 
   // ── State Management ─────────────────────────────────────────────────
