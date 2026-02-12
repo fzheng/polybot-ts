@@ -1,0 +1,31 @@
+{
+  "name": "polybot-ts",
+  "version": "2.0.0",
+  "description": "Polymarket BTC 15-minute dip arbitrage bot with fee-aware orders",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "postinstall": "node scripts/build-sdk.mjs"
+  },
+  "dependencies": {
+    "@catalyst-team/poly-sdk": "github:cyl19970726/poly-sdk",
+    "ink": "^4.4.1",
+    "ink-text-input": "^5.0.1",
+    "react": "^18.2.0",
+    "decimal.js": "^10.4.3",
+    "toml": "^3.0.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.17",
+    "@types/react": "^18.2.55",
+    "typescript": "^5.7.2",
+    "tsx": "^4.7.1",
+    "vitest": "^2.1.8"
+  }
+}

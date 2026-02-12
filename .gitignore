@@ -1,0 +1,74 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# Paper trading output
+paper_trades.jsonl
+data/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS — macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# OS — Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# OS — Linux
+*~
+.directory
+
+# Editor — VSCode
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Editor — JetBrains
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Editor — Vim/Neovim
+*.swp
+*.swo
+*~
+Session.vim
+.netrwhist
+
+# Claude / AI
+.claude/
+.claude_memory/
+CLAUDE.md
+
+# Test coverage
+coverage/
+
+# Misc
+*.tgz
+*.gz
+
+nul

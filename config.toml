@@ -1,0 +1,42 @@
+[api]
+clob_endpoint = "https://clob.polymarket.com"
+gamma_endpoint = "https://gamma-api.polymarket.com"
+chain_id = 137
+use_binance = true              # Use Binance BTC price as oracle reference
+max_price_age_secs = 10         # Reject stale oracle prices
+
+[trading]
+assets = ["BTC"]                # Which coins to trade: "BTC", "ETH", "SOL", "XRP"
+duration = "15m"                # Market duration: "15m", "1h", etc.
+default_shares = 20
+default_sum_target = 0.95       # 5% min profit margin
+default_dip_threshold = 0.20    # 20% drop triggers entry
+window_minutes = 5              # Only enter in first 5 min of round
+max_cycles = 1                  # Max cycles per round
+dump_window_ms = 3000           # 3-second sliding window for dump detection
+use_maker_orders = true         # Use GTC limit orders (maker, 0% fee)
+maker_fallback_to_taker = true  # Fall back to FOK if margin > fee
+taker_fee_rate = 0.0625         # Polymarket neg-risk fee rate (fee_rate_bps=1000)
+max_spread_pct = 0.10           # Skip if bid-ask spread > 10%
+gtc_fill_timeout_ms = 30000     # Cancel GTC if not filled in 30s
+gtc_poll_interval_ms = 1000     # Poll for GTC fills every 1s
+
+[risk]
+max_balance_pct_per_trade = 0.05  # Risk max 5% of balance per cycle
+min_shares = 5                    # Polymarket minimum order size
+max_shares = 100                  # Absolute cap per leg
+consecutive_loss_limit = 3        # Pause after 3 consecutive losses
+cooldown_minutes = 360            # Cool down for 6 hours after consecutive losses
+emergency_enabled = true          # Enable emergency exit system
+exit_before_expiry_minutes = 3    # Liquidate leg 1 if leg 2 not found with N min remaining
+
+[paper]
+enabled = true
+starting_balance = 1000.0
+simulate_fees = true
+simulate_slippage = true
+slippage_pct = 0.02
+log_file = "paper_trades.jsonl"
+record_data = true                # Record price data to disk
+data_dir = "data"                 # Output directory for recordings
+record_interval_ms = 1000         # Recording interval
