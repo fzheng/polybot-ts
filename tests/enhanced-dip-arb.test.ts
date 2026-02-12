@@ -13,7 +13,18 @@ async function flush() {
 }
 
 function createMockSdk() {
-  const realtimeService = new EventEmitter();
+  const realtimeService = Object.assign(new EventEmitter(), {
+    subscribeMarkets: vi.fn((_tokenIds: string[], handlers: any = {}) => {
+      // Mirror SDK behavior: register handler on the EventEmitter filtered by tokenIds
+      const orderbookHandler = (book: any) => {
+        if (_tokenIds.includes(book.assetId ?? book.tokenId)) {
+          handlers.onOrderbook?.(book);
+        }
+      };
+      realtimeService.on('orderbook', orderbookHandler);
+      return { unsubscribe: () => realtimeService.off('orderbook', orderbookHandler) };
+    }),
+  });
 
   const dipArb = Object.assign(new EventEmitter(), {
     updateConfig: vi.fn(),
