@@ -2207,4 +2207,119 @@ describe('EnhancedDipArbStrategy', () => {
       await strategy.stop();
     });
   });
+
+  // ── SDK phase reset (leg1 signals resume after emergency exit / rotation) ──
+  describe('SDK phase reset', () => {
+    it('should reset SDK currentRound.phase to watching after emergency exit', async () => {
+      vi.useFakeTimers();
+      try {
+        // Market ends in 2 minutes — within the 3-minute emergency threshold
+        const sdk = createMockSdk();
+        const config = makeConfig();
+        const strategy = new EnhancedDipArbStrategy(sdk, config);
+        // Use advanceTimersByTimeAsync to process the async start()
+        const startP = strategy.start();
+        await vi.advanceTimersByTimeAsync(100);
+        await startP;
+
+        // Set up currentRound on mock SDK BEFORE started event
+        sdk.dipArb.currentRound = { phase: 'watching', leg1: null };
+
+        // Start round with 4 minutes remaining (above 3-min Gate 2 threshold so leg1 can enter,
+        // but emergency timer fires once we advance past the 3-min threshold)
+        const endTime = new Date(Date.now() + 240 * 1000); // 4 min from now
+        sdk.dipArb.emit('started', {
+          slug: 'btc-15m-round-1',
+          endTime,
+          durationMinutes: 15,
+          upTokenId: 'up-token-123',
+          downTokenId: 'down-token-456',
+        });
+        populateOrderbook(sdk);
+
+        // Advance 600ms so price poll fires (every 500ms) and populates upBids/downBids
+        await vi.advanceTimersByTimeAsync(600);
+
+        const emergencyEvents = collectEvents(strategy, 'emergencyExit');
+
+        // Leg 1 signal → fills in paper mode → notifySdkLeg1Filled sets phase='leg1_filled'
+        sdk.dipArb.emit('signal', makeLeg1Signal());
+        await vi.advanceTimersByTimeAsync(10);
+        expect(sdk.dipArb.currentRound.phase).toBe('leg1_filled');
+
+        // Advance timers past the 3-min-remaining threshold
+        // Currently ~239s remaining, need <180s, so advance by 61s
+        await vi.advanceTimersByTimeAsync(61_000);
+
+        // Emergency exit should have fired and resetCycle should have reset SDK phase
+        expect(emergencyEvents.length).toBe(1);
+        expect(sdk.dipArb.currentRound.phase).toBe('watching');
+        expect(sdk.dipArb.currentRound.leg1).toBeNull();
+
+        await strategy.stop();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('should reset SDK currentRound.phase in handleStarted when rotating to a new market', async () => {
+      const { sdk, strategy } = await setupReady();
+
+      // Set up currentRound
+      sdk.dipArb.currentRound = { phase: 'watching', leg1: null };
+
+      // Leg 1 → fills → SDK phase becomes 'leg1_filled'
+      sdk.dipArb.emit('signal', makeLeg1Signal());
+      await flush();
+      expect(sdk.dipArb.currentRound.phase).toBe('leg1_filled');
+
+      // Simulate market rotation — handleStarted fires for a new market
+      emitStarted(sdk, { slug: 'btc-15m-round-2' });
+      await flush();
+
+      // SDK phase should be reset
+      expect(sdk.dipArb.currentRound.phase).toBe('watching');
+      expect(sdk.dipArb.currentRound.leg1).toBeNull();
+
+      // Leg 1 signal on the new market should be accepted
+      const leg1Events = collectEvents(strategy, 'leg1Executed');
+      populateOrderbook(sdk);
+      sdk.dipArb.emit('signal', makeLeg1Signal());
+      await flush();
+
+      expect(leg1Events.length).toBe(1);
+      await strategy.stop();
+    });
+
+    it('should reset SDK phase after completed cycle then accept leg1 on next market', async () => {
+      const { sdk, strategy } = await setupReady();
+
+      sdk.dipArb.currentRound = { phase: 'watching', leg1: null };
+
+      // Complete full cycle: Leg 1 + Leg 2
+      sdk.dipArb.emit('signal', makeLeg1Signal());
+      await flush();
+      expect(sdk.dipArb.currentRound.phase).toBe('leg1_filled');
+
+      sdk.dipArb.emit('signal', makeLeg2Signal());
+      await flush();
+
+      // After cycle completes, resetCycle resets SDK phase
+      expect(sdk.dipArb.currentRound.phase).toBe('watching');
+      expect(sdk.dipArb.currentRound.leg1).toBeNull();
+
+      // New market rotation — handleStarted resets cycleAttemptedThisRound
+      emitStarted(sdk, { slug: 'btc-15m-round-2' });
+      await flush();
+
+      // Leg 1 signal on the new market should be accepted
+      const leg1Events = collectEvents(strategy, 'leg1Executed');
+      populateOrderbook(sdk);
+      sdk.dipArb.emit('signal', makeLeg1Signal());
+      await flush();
+
+      expect(leg1Events.length).toBe(1);
+      await strategy.stop();
+    });
+  });
 });

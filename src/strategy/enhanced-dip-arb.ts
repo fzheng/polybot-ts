@@ -352,10 +352,18 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     this.upBids = [];
     this.downBids = [];
 
+    // Reset SDK's internal round phase so it emits leg1 signals for the new market.
+    // Without this, notifySdkLeg1Filled() from a previous cycle leaves
+    // currentRound.phase='leg1_filled', causing the SDK to only emit leg2 signals.
+    const dipArb = this.sdk.dipArb as any;
+    if (dipArb.currentRound) {
+      dipArb.currentRound.phase = 'watching';
+      dipArb.currentRound.leg1 = null;
+    }
+
     // Flush stale orderbook data left over from the previous market.
     // The SDK does NOT clear these caches on rotation — bookCache retains
     // resolved prices ($0.01/$0.99) and upAsks/downAsks keep old levels.
-    const dipArb = this.sdk.dipArb as any;
     const realtimeService = dipArb?.realtimeService;
     if (realtimeService?.bookCache) {
       realtimeService.bookCache.clear();
@@ -1685,6 +1693,16 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     this.leg1SellOrderId = null;
     this.leg2SellOrderId = null;
     this.clearEmergencyTimer();
+
+    // Reset SDK's round phase so it emits leg1 signals again.
+    // Without this, notifySdkLeg1Filled() leaves phase='leg1_filled'
+    // and the SDK only emits leg2 signals for the rest of the market.
+    const dipArb = this.sdk.dipArb as any;
+    if (dipArb.currentRound) {
+      dipArb.currentRound.phase = 'watching';
+      dipArb.currentRound.leg1 = null;
+    }
+
     this.setState(StrategyState.WATCHING);
   }
 
