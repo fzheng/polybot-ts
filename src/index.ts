@@ -6,6 +6,9 @@ import { loadConfig } from './config.js';
 import { EnhancedDipArbStrategy } from './strategy/enhanced-dip-arb.js';
 import { PaperTrader } from './paper/paper-trader.js';
 import { App } from './terminal/app.js';
+import { createSessionLogger, type SessionLogger } from './logging/session-logger.js';
+
+let sessionLogger: SessionLogger | null = null;
 
 async function main() {
   // ── Load config ────────────────────────────────────────────────────
@@ -14,6 +17,10 @@ async function main() {
     : 'config.toml';
 
   const config = loadConfig(configPath);
+  sessionLogger = createSessionLogger('tui');
+  sessionLogger.log(`Session log file: ${sessionLogger.filePath}`);
+  sessionLogger.log(`Mode: ${config.paper.enabled ? 'paper' : 'live'}`);
+  console.error(`Session log file: ${sessionLogger.filePath}`);
 
   // ── Initialize poly-sdk ────────────────────────────────────────────
   let sdk: PolymarketSDK;
@@ -38,9 +45,34 @@ async function main() {
 
   // ── Strategy ───────────────────────────────────────────────────────
   const strategy = new EnhancedDipArbStrategy(sdk, config);
+  strategy.on('log', (entry: { level: string; message: string }) => {
+    sessionLogger?.log(`[strategy:${entry.level}] ${entry.message}`);
+  });
+  strategy.on('stateChange', (state: string) => {
+    sessionLogger?.log(`[state] ${state}`);
+  });
+  strategy.on('newRound', (data: { slug: string; secondsRemaining: number }) => {
+    sessionLogger?.log(`[round] ${data.slug} (${data.secondsRemaining}s remaining)`);
+  });
+  strategy.on('error', (err: Error) => {
+    sessionLogger?.log(`[strategy:error] ${err.message}`);
+  });
 
   // Wire paper trader to strategy events
   if (paperTrader) {
+    paperTrader.on('trade', (trade: any) => {
+      sessionLogger?.log(
+        `[paper:trade] side=${String(trade.side)} shares=${trade.shares?.toString?.() ?? trade.shares} ` +
+        `price=${trade.price?.toString?.() ?? trade.price}`,
+      );
+    });
+    paperTrader.on('settled', (settled: any) => {
+      sessionLogger?.log(
+        `[paper:settled] round=${settled.roundSlug} winning=${settled.winningSide} ` +
+        `payout=${settled.payout?.toString?.() ?? settled.payout}`,
+      );
+    });
+
     strategy.on('leg1Executed', async (leg) => {
       const round = strategy.getCurrentRound() ?? 'unknown';
       await paperTrader.buy(leg, round);
@@ -103,10 +135,13 @@ async function main() {
 
   // Cleanup
   await strategy.stop();
+  await sessionLogger?.close();
   process.exit(0);
 }
 
 main().catch((err) => {
+  sessionLogger?.log(`Fatal error: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+  void sessionLogger?.close();
   console.error('Fatal error:', err);
   process.exit(1);
 });

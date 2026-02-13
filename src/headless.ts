@@ -2,28 +2,26 @@
  * Headless runner — runs the strategy without the TUI, logging to a file.
  * Usage: npx tsx src/headless.ts
  */
-import fs from 'fs';
 import Decimal from 'decimal.js';
 import { PolymarketSDK } from '@catalyst-team/poly-sdk';
 import { loadConfig } from './config.js';
 import { EnhancedDipArbStrategy } from './strategy/enhanced-dip-arb.js';
 import { PaperTrader } from './paper/paper-trader.js';
+import { createSessionLogger, type SessionLogger } from './logging/session-logger.js';
 
-const LOG_FILE = 'polybot.log';
-
-function ts(): string {
-  return new Date().toLocaleTimeString('en-US', { hour12: false });
-}
+let sessionLogger: SessionLogger | null = null;
 
 function log(msg: string): void {
-  const line = `[${ts()}] ${msg}`;
-  console.log(line);
-  fs.appendFileSync(LOG_FILE, line + '\n');
+  if (sessionLogger) {
+    sessionLogger.log(msg);
+  } else {
+    console.log(`[${new Date().toISOString()}] ${msg}`);
+  }
 }
 
 async function main() {
-  // Clear log file
-  fs.writeFileSync(LOG_FILE, '');
+  sessionLogger = createSessionLogger('headless', { alsoConsole: true });
+  log(`Session log file: ${sessionLogger.filePath}`);
   log('=== PolyBot Headless Mode ===');
 
   const config = loadConfig('config.toml');
@@ -86,11 +84,27 @@ async function main() {
   strategy.on('newRound', (data: any) => {
     log(`New round: ${data.slug} (${data.secondsRemaining}s remaining)`);
   });
+  strategy.on('error', (err: Error) => {
+    log(`[error] ${err.message}`);
+  });
   strategy.on('priceUpdate', (data: any) => {
     // Log price every 30 seconds to avoid spam
     if (!main._lastPriceLog || Date.now() - main._lastPriceLog > 30_000) {
       main._lastPriceLog = Date.now();
-      log(`Prices: UP bid=${data.upBid?.toFixed(4) ?? '-.--'} ask=${data.upAsk?.toFixed(4) ?? '-.--'} | DOWN bid=${data.downBid?.toFixed(4) ?? '-.--'} ask=${data.downAsk?.toFixed(4) ?? '-.--'} | SUM=${data.sum?.toFixed(4) ?? '-.--'}`);
+      const asNumber = (value: unknown): number | null => {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : null;
+      };
+      const fmt = (value: unknown): string => {
+        const n = asNumber(value);
+        return n == null ? '-.--' : n.toFixed(4);
+      };
+
+      log(
+        `Prices: UP bid=${fmt(data.upBid)} ask=${fmt(data.upAsk)} | ` +
+        `DOWN bid=${fmt(data.downBid)} ask=${fmt(data.downAsk)} | ` +
+        `SUM=${fmt(data.sum)}`,
+      );
     }
   });
 
@@ -102,6 +116,7 @@ async function main() {
   process.on('SIGINT', async () => {
     log('Shutting down...');
     await strategy.stop();
+    await sessionLogger?.close();
     process.exit(0);
   });
 }
@@ -111,5 +126,6 @@ main._lastPriceLog = 0 as number;
 
 main().catch((err) => {
   log(`Fatal error: ${err}`);
+  void sessionLogger?.close();
   process.exit(1);
 });

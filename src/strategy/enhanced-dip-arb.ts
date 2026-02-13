@@ -46,6 +46,12 @@ export class EnhancedDipArbStrategy extends EventEmitter {
   private orderPlacer: FeeAwareOrderPlacer;
   private positionSizer: PositionSizer;
   private config: BotConfig;
+  private readonly onSignal = this.handleSignal.bind(this);
+  private readonly onExecution = this.handleExecution.bind(this);
+  private readonly onRoundComplete = this.handleRoundComplete.bind(this);
+  private readonly onStarted = this.handleStarted.bind(this);
+  private readonly onNewRound = this.handleNewRound.bind(this);
+  private readonly onSdkError = this.handleError.bind(this);
 
   // Strategy state
   private state: StrategyState = StrategyState.WATCHING;
@@ -65,6 +71,9 @@ export class EnhancedDipArbStrategy extends EventEmitter {
   // Exit sell order tracking ($0.99 GTC SELLs placed on fill)
   private leg1SellOrderId: string | null = null;
   private leg2SellOrderId: string | null = null;
+
+  // Guard against overlapping async fill poll callbacks
+  private fillPollInFlight = false;
 
   // Idempotency guard — both handleExecution and onGtcFilled can fire for same leg2 fill
   private cycleFinalized = false;
@@ -109,21 +118,34 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     this.sdk = sdk;
     this.config = config;
     this.orderPlacer = new FeeAwareOrderPlacer(config.trading);
-    this.currentBalance = config.paper.enabled ? config.paper.startingBalance : 1000;
+    this.currentBalance = config.paper.startingBalance; // Updated from wallet on live start()
     this.positionSizer = new PositionSizer(config.risk, this.currentBalance);
   }
 
   // ── Lifecycle ────────────────────────────────────────────────────────
 
   async start(): Promise<void> {
+    const { assets, duration } = this.config.trading;
+    if (assets.length === 0) {
+      throw new Error('trading.assets must contain at least one symbol');
+    }
+    const unsupportedAsset = assets.find(a => !['BTC', 'ETH', 'SOL', 'XRP'].includes(a));
+    if (unsupportedAsset) {
+      throw new Error(`Unsupported trading asset: ${unsupportedAsset}. Supported: BTC, ETH, SOL, XRP`);
+    }
+    if (duration !== '5m' && duration !== '15m') {
+      throw new Error(`Unsupported trading duration: ${duration}. Supported: 5m, 15m`);
+    }
+
     // Configure the underlying DipArbService
+    const sdkLeg2TimeoutSeconds = this.config.paper.enabled ? 86400 : 900;
     const dipConfig: Partial<DipArbServiceConfig> = {
       shares: this.config.trading.defaultShares,
       sumTarget: this.config.trading.defaultSumTarget,
       dipThreshold: this.config.trading.defaultDipThreshold,
       slidingWindowMs: this.config.trading.dumpWindowMs,
       windowMinutes: this.config.trading.windowMinutes,
-      leg2TimeoutSeconds: 900, // We handle timeout ourselves via exitBeforeExpiryMinutes
+      leg2TimeoutSeconds: sdkLeg2TimeoutSeconds, // Strategy manages timeout via emergency timer
       enableSurge: false, // Disabled: surge signals buy the opposite side at ceiling prices (e.g. UP@$0.97 when DOWN surges from $0.04→$0.05)
       autoMerge: true,
       autoExecute: false, // We control execution; explicit settlement in handleRoundComplete + autoSettle as fallback
@@ -131,23 +153,17 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     };
     this.sdk.dipArb.updateConfig(dipConfig);
 
-    // Wire up SDK events
-    this.sdk.dipArb.on('signal', this.handleSignal.bind(this));
-    this.sdk.dipArb.on('execution', this.handleExecution.bind(this));
-    this.sdk.dipArb.on('roundComplete', this.handleRoundComplete.bind(this));
-    this.sdk.dipArb.on('started', this.handleStarted.bind(this));
-    this.sdk.dipArb.on('newRound', this.handleNewRound.bind(this));
-    this.sdk.dipArb.on('error', this.handleError.bind(this));
+    // Wire up SDK events once per strategy lifecycle.
+    this.attachSdkListeners();
 
     // Enable auto-rotation — settlement is always the fallback for unfilled sell orders
-    const { assets, duration } = this.config.trading;
     const sdkUnderlyings = assets as ('BTC' | 'ETH' | 'SOL' | 'XRP')[];
     const sdkDuration = duration as '5m' | '15m';
     this.sdk.dipArb.enableAutoRotate({
       enabled: true,
       underlyings: sdkUnderlyings,
       duration: sdkDuration,
-      autoSettle: true,
+      autoSettle: !this.config.paper.enabled,
       settleStrategy: 'redeem',
       preloadMinutes: 2,
       redeemWaitMinutes: 5,
@@ -181,10 +197,18 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     if (!started) {
       const msg = 'Failed to find any market after 3 attempts';
       this.log('error', msg);
-      this.emit('error', new Error(msg));
+      this.detachSdkListeners();
+      const err = new Error(msg);
+      this.emit('error', err);
+      throw err;
     }
 
-    this.log('info', `Enhanced DipArb started — ${assets.join('/')} ${duration}`);
+    // Query live wallet balance for position sizing
+    if (!this.config.paper.enabled) {
+      await this.refreshLiveBalance();
+    }
+
+    this.log('info', `Enhanced DipArb started — ${assets.join('/')} ${duration} (balance=$${this.currentBalance.toFixed(2)})`);
   }
 
   async stop(): Promise<void> {
@@ -200,8 +224,27 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       }
     }
     this.sdk.dipArb.stop();
+    this.detachSdkListeners();
     this.setState(StrategyState.WATCHING);
     this.log('info', 'Strategy stopped');
+  }
+
+  private attachSdkListeners(): void {
+    this.sdk.dipArb.on('signal', this.onSignal);
+    this.sdk.dipArb.on('execution', this.onExecution);
+    this.sdk.dipArb.on('roundComplete', this.onRoundComplete);
+    this.sdk.dipArb.on('started', this.onStarted);
+    this.sdk.dipArb.on('newRound', this.onNewRound);
+    this.sdk.dipArb.on('error', this.onSdkError);
+  }
+
+  private detachSdkListeners(): void {
+    this.sdk.dipArb.off('signal', this.onSignal);
+    this.sdk.dipArb.off('execution', this.onExecution);
+    this.sdk.dipArb.off('roundComplete', this.onRoundComplete);
+    this.sdk.dipArb.off('started', this.onStarted);
+    this.sdk.dipArb.off('newRound', this.onNewRound);
+    this.sdk.dipArb.off('error', this.onSdkError);
   }
 
   /**
@@ -254,6 +297,24 @@ export class EnhancedDipArbStrategy extends EventEmitter {
    */
   private handleStarted(event: any): void {
     const slug = event.slug ?? event.underlying ?? 'unknown';
+
+    // Cancel any outstanding live orders from previous market before resetting state
+    if (!this.config.paper.enabled) {
+      const ordersToCancel = [
+        this.pendingLeg1OrderId,
+        this.pendingLeg2OrderId,
+        this.leg1SellOrderId,
+        this.leg2SellOrderId,
+      ].filter(Boolean) as string[];
+      for (const orderId of ordersToCancel) {
+        this.sdk.tradingService.cancelOrder(orderId).catch(() => {
+          /* order may already be filled/cancelled/expired */
+        });
+      }
+      if (ordersToCancel.length > 0) {
+        this.log('info', `Cancelled ${ordersToCancel.length} orders from previous market`);
+      }
+    }
 
     // Full state reset for the new market
     this.currentRound = slug;
@@ -322,10 +383,16 @@ export class EnhancedDipArbStrategy extends EventEmitter {
   private handleNewRound(event: any): void {
     // Update round ID to the more specific per-round ID
     this.currentRound = event.roundId ?? this.currentRound;
-    this.cycleAttemptedThisRound = false;
-    this.upHistory = [];
-    this.downHistory = [];
-    this.expectedOrderIds.clear();
+
+    // Don't reset cycle state if we're mid-cycle — protect live orders and fills
+    const midCycle = this.state === StrategyState.LEG1_PENDING
+      || this.state === StrategyState.WAITING_FOR_HEDGE
+      || this.state === StrategyState.LEG2_PENDING;
+    if (!midCycle) {
+      this.cycleAttemptedThisRound = false;
+      this.upHistory = [];
+      this.downHistory = [];
+    }
 
     // Always derive remaining time from marketEndTimeMs (set in handleStarted).
     // The SDK's newRound event may report a full-duration endTime that ignores
@@ -359,6 +426,10 @@ export class EnhancedDipArbStrategy extends EventEmitter {
    * and applies our filters + fee-aware ordering BEFORE execution.
    */
   private async handleSignal(signal: any): Promise<void> {
+    if (!this.isSignalForCurrentMarket(signal)) {
+      return;
+    }
+
     // Track price history for trend detection
     this.recordPrice(signal);
 
@@ -388,6 +459,32 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     } else if (signal.type === 'leg2') {
       await this.handleLeg2Signal(signal);
     }
+  }
+
+  /**
+   * Ignore stale signals that reference tokens from a previous market.
+   * This can happen during market rotation when delayed events arrive late.
+   */
+  private isSignalForCurrentMarket(signal: any): boolean {
+    const tokenId = typeof signal?.tokenId === 'string' ? signal.tokenId : '';
+    if (!tokenId) return true;
+
+    const upTokenId = this.currentUpTokenId;
+    const downTokenId = this.currentDownTokenId;
+
+    // Token IDs may not be available yet during startup.
+    if (!upTokenId && !downTokenId) return true;
+
+    if (tokenId === upTokenId || tokenId === downTokenId) {
+      return true;
+    }
+
+    this.log(
+      'debug',
+      `Ignoring stale signal token ${tokenId.slice(-8)} ` +
+      `(UP=${upTokenId?.slice(-8) ?? 'none'}, DOWN=${downTokenId?.slice(-8) ?? 'none'})`,
+    );
+    return false;
   }
 
   private async handleLeg1Signal(signal: any): Promise<void> {
@@ -550,7 +647,8 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
         const totalCost = this.leg1.price.times(this.leg1.shares)
           .plus(leg2.price.times(leg2.shares));
-        const payout = this.leg1.shares; // $1 per share pair
+        const matchedShares = Decimal.min(this.leg1.shares, leg2.shares); // Partial fills: payout on matched pairs only
+        const payout = matchedShares; // $1 per matched share pair
         const profit = payout.minus(totalCost);
 
         const result: CycleResult = {
@@ -662,7 +760,8 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
     const totalCost = this.leg1.price.times(this.leg1.shares)
       .plus(leg2Info.price.times(leg2Info.shares));
-    const payout = this.leg1.shares; // $1 per share pair
+    const matchedShares = Decimal.min(this.leg1.shares, leg2Info.shares); // Partial fills: payout on matched pairs only
+    const payout = matchedShares; // $1 per matched share pair
     const profit = payout.minus(totalCost);
 
     const result: CycleResult = {
@@ -687,6 +786,10 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       `CYCLE COMPLETE (live): cost=$${totalCost.toFixed(4)}, profit=$${profit.toFixed(4)} (${result.profitPct.times(100).toFixed(2)}%)`,
     );
     this.emit('cycleComplete', result);
+
+    // Refresh balance after cycle for accurate position sizing next time
+    this.refreshLiveBalance().catch(() => {});
+
   }
 
   private async handleRoundComplete(result: any): Promise<void> {
@@ -694,19 +797,26 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     // Without this, the REST fallback fires 404s during the gap between rounds.
     this.stopPricePoll();
 
-    const profit = new Decimal(result.profit ?? 0);
-    if (result.status === 'completed') {
-      this.stats.cyclesCompleted++;
-      if (profit.greaterThan(0)) {
-        this.stats.cyclesWon++;
+    // Only update stats if finalizeLiveCycle hasn't already counted this cycle.
+    // finalizeLiveCycle sets cycleFinalized=true when it records stats.
+    if (!this.cycleFinalized) {
+      const profit = new Decimal(result.profit ?? 0);
+      if (result.status === 'completed') {
+        this.stats.cyclesCompleted++;
+        if (profit.greaterThan(0)) {
+          this.stats.cyclesWon++;
+        }
+        this.stats.totalProfit = this.stats.totalProfit.plus(profit);
+        this.positionSizer.recordResult(profit.toNumber());
+        this.log('info', `Round complete: profit=$${profit.toFixed(4)}`);
+      } else {
+        this.stats.cyclesAbandoned++;
+        this.log('warn', `Round abandoned: status=${result.status}`);
       }
-      this.stats.totalProfit = this.stats.totalProfit.plus(profit);
-      this.log('info', `Round complete: profit=$${profit.toFixed(4)}`);
+      this.updateWinRate();
     } else {
-      this.stats.cyclesAbandoned++;
-      this.log('warn', `Round abandoned: status=${result.status}`);
+      this.log('info', `Round complete (stats already recorded by finalizeLiveCycle)`);
     }
-    this.updateWinRate();
 
     // Explicitly settle any positions that weren't sold via $0.99 exit sells
     // (e.g., losing side never reaches $0.99). autoSettle is a fallback but
@@ -732,11 +842,21 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
   // ── Live Execution Helpers ───────────────────────────────────────────
 
+  /** Validate that a price is within Polymarket binary option bounds (0, 1). */
+  private isValidPrice(price: number): boolean {
+    return Number.isFinite(price) && price > 0 && price < 1;
+  }
+
   private async executeLeg1Live(signal: any, orderType: 'GTC' | 'FOK'): Promise<boolean> {
     const tokenId = signal.tokenId;
     const price = signal.targetPrice ?? signal.currentPrice;
     const shares = this.positionSizer.calculateShares(this.currentBalance, price);
     if (shares === 0) return false;
+
+    if (!this.isValidPrice(price)) {
+      this.log('error', `Leg 1 price out of range: $${price} (must be 0 < p < 1)`);
+      return false;
+    }
 
     const side: Side = signal.dipSide === 'UP' ? Side.UP : Side.DOWN;
 
@@ -750,6 +870,10 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     if (orderType === 'GTC') {
       // Place a limit buy at the ask price (to get filled)
       const limitPrice = bestAsk > 0 ? bestAsk : price;
+      if (!this.isValidPrice(limitPrice)) {
+        this.log('error', `Leg 1 GTC limit price out of range: $${limitPrice}`);
+        return false;
+      }
       const order = await this.sdk.tradingService.createLimitOrder({
         tokenId,
         side: 'BUY',
@@ -782,10 +906,16 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
     } else {
       // FOK market order — fills immediately or fails
+      const marketPrice = bestAsk > 0 ? bestAsk : price;
+      if (!this.isValidPrice(marketPrice)) {
+        this.log('error', `Leg 1 FOK market price out of range: $${marketPrice}`);
+        return false;
+      }
       const order = await this.sdk.tradingService.createMarketOrder({
         tokenId,
         side: 'BUY',
-        amount: shares * price,
+        amount: shares * marketPrice,
+        price: marketPrice,
         orderType: 'FOK',
       });
 
@@ -799,7 +929,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
       const leg: LegInfo = {
         side,
-        price: new Decimal(price),
+        price: new Decimal(marketPrice), // Use actual execution price, not signal price
         shares: new Decimal(shares),
         tokenId,
         timestamp: new Date(),
@@ -832,6 +962,11 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
     // Place limit buy at the ask price to get filled
     const limitPrice = bestAsk > 0 ? bestAsk : price;
+
+    if (!this.isValidPrice(limitPrice)) {
+      this.log('error', `Leg 2 GTC limit price out of range: $${limitPrice}`);
+      return;
+    }
 
     const order = await this.sdk.tradingService.createLimitOrder({
       tokenId,
@@ -896,7 +1031,10 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
     this.clearFillPollTimer();
 
+    this.fillPollInFlight = false;
     this.fillPollTimer = setInterval(async () => {
+      if (this.fillPollInFlight) return; // Prevent overlapping async polls
+      this.fillPollInFlight = true;
       try {
         // Use getOrder() for explicit status check instead of getOpenOrders()
         const order = await this.sdk.tradingService.getOrder(orderId);
@@ -970,6 +1108,8 @@ export class EnhancedDipArbStrategy extends EventEmitter {
         }
       } catch (err) {
         this.log('error', `Fill poll error: ${err}`);
+      } finally {
+        this.fillPollInFlight = false;
       }
     }, pollMs);
   }
@@ -1281,7 +1421,8 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
     // Check every second if we're running out of time
     this.emergencyTimer = setInterval(() => {
-      if (!this.leg1 || this.state !== StrategyState.WAITING_FOR_HEDGE) return;
+      // Fire during both WAITING_FOR_HEDGE and LEG2_PENDING (GTC leg2 not yet filled)
+      if (!this.leg1 || (this.state !== StrategyState.WAITING_FOR_HEDGE && this.state !== StrategyState.LEG2_PENDING)) return;
 
       const secsRemaining = Math.max(0, Math.round((this.marketEndTimeMs - Date.now()) / 1000));
       if (secsRemaining <= exitThresholdSecs) {
@@ -1346,10 +1487,18 @@ export class EnhancedDipArbStrategy extends EventEmitter {
         this.leg1SellOrderId = null;
       }
       try {
+        const lastPrice = lastMarketPrice.toNumber();
+        const entryPrice = this.leg1.price.toNumber();
+        const emergencySellPrice =
+          (lastPrice > 0 && lastPrice < 1)
+            ? lastPrice
+            : (entryPrice > 0 && entryPrice < 1 ? entryPrice : 0.5);
+
         await this.sdk.tradingService.createMarketOrder({
           tokenId: this.leg1.tokenId,
           side: 'SELL',
-          amount: this.leg1.shares.toNumber(),
+          amount: this.leg1.shares.toNumber() * emergencySellPrice, // USDC value, not shares
+          price: emergencySellPrice,
           orderType: 'FOK',
         });
         this.log('info', 'Emergency sell executed');
@@ -1375,6 +1524,12 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     this.stats.totalProfit = this.stats.totalProfit.plus(profit);
     this.positionSizer.recordResult(profit.toNumber());
     this.updateWinRate();
+
+    // Refresh balance after emergency exit for accurate position sizing
+    if (!this.config.paper.enabled) {
+      this.refreshLiveBalance().catch(() => {});
+    }
+
     await this.resetCycle();
   }
 
@@ -1524,7 +1679,8 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
     this.leg1 = null;
     this.leg2 = null;
-    this.cycleFinalized = false;
+    // Don't reset cycleFinalized here — handleRoundComplete may still need it.
+    // It gets reset in handleStarted() when a new market begins.
     // Don't cancel sell orders — they stay on the book for settlement/auto-fill
     this.leg1SellOrderId = null;
     this.leg2SellOrderId = null;
@@ -1548,6 +1704,20 @@ export class EnhancedDipArbStrategy extends EventEmitter {
   /** Update the balance the position sizer uses for sizing decisions. */
   updateBalance(balance: number): void {
     this.currentBalance = balance;
+  }
+
+  /** Query USDC balance from the CLOB and update currentBalance for position sizing. */
+  private async refreshLiveBalance(): Promise<void> {
+    try {
+      const result = await this.sdk.tradingService.getBalanceAllowance('COLLATERAL');
+      const balance = Number(result.balance);
+      if (balance > 0) {
+        this.currentBalance = balance;
+        this.log('info', `Live balance: $${balance.toFixed(2)}`);
+      }
+    } catch (err) {
+      this.log('warn', `Failed to query live balance: ${err}`);
+    }
   }
 
   // ── Logging ──────────────────────────────────────────────────────────

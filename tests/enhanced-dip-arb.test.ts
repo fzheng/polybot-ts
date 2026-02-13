@@ -226,6 +226,67 @@ describe('EnhancedDipArbStrategy', () => {
       expect(strategy.getState()).toBe(StrategyState.WATCHING);
       await strategy.stop();
     });
+
+    it('should reject unsupported duration on start', async () => {
+      const sdk = createMockSdk();
+      const cfg = makeConfig({
+        trading: { ...makeConfig().trading, duration: '1h' },
+      });
+      const strategy = new EnhancedDipArbStrategy(sdk, cfg);
+
+      await expect(strategy.start()).rejects.toThrow('Unsupported trading duration');
+      expect(sdk.dipArb.start).not.toHaveBeenCalled();
+    });
+
+    it('should disable SDK settle and extend SDK leg2 timeout in paper mode', async () => {
+      const sdk = createMockSdk();
+      const strategy = new EnhancedDipArbStrategy(sdk, makeConfig());
+
+      await strategy.start();
+
+      expect(sdk.dipArb.updateConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          leg2TimeoutSeconds: 86400,
+        }),
+      );
+      expect(sdk.dipArb.enableAutoRotate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          autoSettle: false,
+        }),
+      );
+      await strategy.stop();
+    });
+
+    it('should keep SDK settle enabled and normal leg2 timeout in live mode', async () => {
+      const sdk = createMockSdk();
+      const strategy = new EnhancedDipArbStrategy(sdk, makeConfig({
+        paper: {
+          enabled: false,
+          startingBalance: 1000,
+          simulateFees: true,
+          simulateSlippage: true,
+          slippagePct: 0.02,
+          logFile: 'test.jsonl',
+          recordData: false,
+          dataDir: 'data',
+          recordIntervalMs: 1000,
+        },
+      }));
+
+      await strategy.start();
+
+      expect(sdk.dipArb.updateConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          leg2TimeoutSeconds: 900,
+        }),
+      );
+      expect(sdk.dipArb.enableAutoRotate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          autoSettle: true,
+        }),
+      );
+      await strategy.stop();
+    });
   });
 
   // ── Round Management ───────────────────────────────────────────────────
@@ -311,6 +372,18 @@ describe('EnhancedDipArbStrategy', () => {
       sdk.dipArb.emit('signal', makeLeg1Signal());
       await flush();
       expect(strategy.getState()).toBe(StrategyState.WAITING_FOR_HEDGE);
+      await strategy.stop();
+    });
+
+    it('should ignore stale-token signals after market rotation', async () => {
+      const { sdk, strategy } = await setupReady();
+      const leg1Events = collectEvents(strategy, 'leg1Executed');
+
+      sdk.dipArb.emit('signal', makeLeg1Signal({ tokenId: 'stale-token-999' }));
+      await flush();
+
+      expect(leg1Events).toHaveLength(0);
+      expect(strategy.getState()).toBe(StrategyState.WATCHING);
       await strategy.stop();
     });
 
@@ -575,6 +648,9 @@ describe('EnhancedDipArbStrategy', () => {
       await flush();
 
       expect(leg1Events).toHaveLength(1);
+      expect(sdk.tradingService.createMarketOrder).toHaveBeenCalledWith(
+        expect.objectContaining({ side: 'BUY', orderType: 'FOK', price: 0.4 }),
+      );
       expect(strategy.getState()).toBe(StrategyState.WAITING_FOR_HEDGE);
       await strategy.stop();
     });
@@ -1244,10 +1320,11 @@ describe('EnhancedDipArbStrategy', () => {
       const errors = collectEvents(strategy, 'error');
 
       const startPromise = strategy.start();
+      const rejectedStart = expect(startPromise).rejects.toThrow('Failed to find any market');
       await vi.advanceTimersByTimeAsync(0);
       await vi.advanceTimersByTimeAsync(30000);
       await vi.advanceTimersByTimeAsync(30000);
-      await startPromise;
+      await rejectedStart;
 
       expect(errors).toHaveLength(1);
       expect(errors[0].message).toContain('Failed to find any market');
@@ -1468,6 +1545,548 @@ describe('EnhancedDipArbStrategy', () => {
       expect(sdk.tradingService.createMarketOrder).toHaveBeenCalledWith(
         expect.objectContaining({ side: 'SELL', orderType: 'FOK' }),
       );
+      await strategy.stop();
+    });
+  });
+
+  // ── Fix #1: Emergency sell amount (USDC value, not shares) ────────────
+
+  describe('fix #1 — emergency sell amount is USDC value', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('should pass shares * price as amount, not just shares', async () => {
+      const sdk = createMockSdk();
+      const config = makeConfig({
+        trading: {
+          ...makeConfig().trading,
+          useMakerOrders: false, makerFallbackToTaker: true,
+        },
+        paper: { enabled: false, startingBalance: 1000, simulateFees: true, simulateSlippage: true, slippagePct: 0.02, logFile: 'test.jsonl', recordData: false, dataDir: 'data', recordIntervalMs: 1000 },
+      });
+      const strategy = new EnhancedDipArbStrategy(sdk, config);
+      await strategy.start();
+      emitStarted(sdk, {
+        endTime: new Date(Date.now() + 240 * 1000),
+      });
+      populateOrderbook(sdk);
+
+      // FOK leg1 fill at $0.40
+      sdk.tradingService.createMarketOrder.mockResolvedValue({ success: true, orderId: 'fok-1' });
+      sdk.tradingService.createLimitOrder.mockResolvedValue({ orderId: 'exit-sell-1' });
+
+      sdk.dipArb.emit('signal', makeLeg1Signal({ currentPrice: 0.40 }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(strategy.getState()).toBe(StrategyState.WAITING_FOR_HEDGE);
+
+      // Clear mocks to isolate emergency sell call
+      sdk.tradingService.createMarketOrder.mockClear();
+      sdk.tradingService.createMarketOrder.mockResolvedValue({ success: true });
+
+      // Trigger emergency exit
+      await vi.advanceTimersByTimeAsync(61_000);
+
+      // Verify the SELL call has amount = shares * price (not just shares)
+      const sellCall = sdk.tradingService.createMarketOrder.mock.calls.find(
+        (c: any[]) => c[0]?.side === 'SELL',
+      );
+      expect(sellCall).toBeDefined();
+      const sellArgs = sellCall![0];
+      // amount should be shares * emergencySellPrice, not just shares
+      // With $1000 balance, 5% = $50, $50/0.40 = 125 → capped at 100 shares
+      // Emergency sell price = last market price (0.40 from signal)
+      // So amount should be 100 * 0.40 = 40, NOT just 100
+      expect(sellArgs.amount).toBeLessThan(sellArgs.price * 200); // Sanity check: not just raw shares
+      expect(sellArgs.amount).toBeCloseTo(100 * sellArgs.price, 2);
+      await strategy.stop();
+    });
+  });
+
+  // ── Fix #2: FOK Leg 1 records marketPrice ────────────────────────────
+
+  describe('fix #2 — FOK leg1 records actual execution price', () => {
+    it('should record bestAsk as price, not signal.targetPrice', async () => {
+      const { sdk, strategy } = await setupReady({
+        trading: { ...makeConfig().trading, useMakerOrders: false, makerFallbackToTaker: true },
+        paper: { enabled: false, startingBalance: 1000, simulateFees: true, simulateSlippage: true, slippagePct: 0.02, logFile: 'test.jsonl', recordData: false, dataDir: 'data', recordIntervalMs: 1000 },
+      });
+
+      sdk.tradingService.createMarketOrder.mockResolvedValue({ success: true, orderId: 'fok-1' });
+      sdk.tradingService.createLimitOrder.mockResolvedValue({ orderId: 'sell-1' });
+
+      const leg1Events = collectEvents(strategy, 'leg1Executed');
+
+      // Signal with targetPrice=0.35 but bestAsk (from SDK upAsks) is $0.40
+      sdk.dipArb.emit('signal', makeLeg1Signal({
+        currentPrice: 0.35,
+        targetPrice: 0.35,
+      }));
+      await flush();
+
+      expect(leg1Events).toHaveLength(1);
+      // Should use marketPrice (bestAsk = 0.40), not signal price (0.35)
+      expect(leg1Events[0].price.toNumber()).toBe(0.40);
+      await strategy.stop();
+    });
+  });
+
+  // ── Fix #3: Emergency timer covers LEG2_PENDING ──────────────────────
+
+  describe('fix #3 — emergency timer fires during LEG2_PENDING', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('should trigger emergency exit in LEG2_PENDING state', async () => {
+      const sdk = createMockSdk();
+      const config = makeConfig({
+        paper: { enabled: false, startingBalance: 1000, simulateFees: true, simulateSlippage: true, slippagePct: 0.02, logFile: 'test.jsonl', recordData: false, dataDir: 'data', recordIntervalMs: 1000 },
+        trading: {
+          ...makeConfig().trading,
+          gtcFillTimeoutMs: 120_000, // Long timeout so emergency timer fires first
+          gtcPollIntervalMs: 100,
+        },
+      });
+      const strategy = new EnhancedDipArbStrategy(sdk, config);
+      await strategy.start();
+      emitStarted(sdk, {
+        endTime: new Date(Date.now() + 240 * 1000), // 4 min
+      });
+      populateOrderbook(sdk);
+
+      // Place GTC leg1
+      sdk.tradingService.createLimitOrder.mockResolvedValue({ orderId: 'gtc-leg1' });
+      sdk.dipArb.emit('signal', makeLeg1Signal());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(strategy.getState()).toBe(StrategyState.LEG1_PENDING);
+
+      // Simulate leg1 fill
+      sdk.tradingService.getOrder.mockResolvedValueOnce({ orderId: 'gtc-leg1', status: 'filled' });
+      await vi.advanceTimersByTimeAsync(150);
+      expect(strategy.getState()).toBe(StrategyState.WAITING_FOR_HEDGE);
+
+      // Place GTC leg2
+      sdk.tradingService.createLimitOrder.mockResolvedValue({ orderId: 'gtc-leg2' });
+      sdk.dipArb.emit('signal', makeLeg2Signal());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(strategy.getState()).toBe(StrategyState.LEG2_PENDING);
+
+      // Leg2 stays open (never fills)
+      sdk.tradingService.getOrder.mockResolvedValue({ orderId: 'gtc-leg2', status: 'open' });
+      sdk.tradingService.createMarketOrder.mockResolvedValue({ success: true });
+
+      const emergencyEvents = collectEvents(strategy, 'emergencyExit');
+
+      // Advance past 3-min threshold (from 240s to <180s)
+      await vi.advanceTimersByTimeAsync(61_000);
+
+      // Emergency timer should have fired even in LEG2_PENDING
+      expect(emergencyEvents).toHaveLength(1);
+      expect(emergencyEvents[0].reason).toContain('Time exit');
+      await strategy.stop();
+    });
+  });
+
+  // ── Fix #4: handleNewRound mid-cycle guard ────────────────────────────
+
+  describe('fix #4 — handleNewRound does not corrupt mid-cycle state', () => {
+    it('should not reset cycleAttemptedThisRound during active cycle', async () => {
+      const { sdk, strategy } = await setupReady({
+        paper: { enabled: false, startingBalance: 1000, simulateFees: true, simulateSlippage: true, slippagePct: 0.02, logFile: 'test.jsonl', recordData: false, dataDir: 'data', recordIntervalMs: 1000 },
+      });
+
+      // Place GTC leg1 → LEG1_PENDING
+      sdk.tradingService.createLimitOrder.mockResolvedValue({ orderId: 'gtc-leg1' });
+      sdk.dipArb.emit('signal', makeLeg1Signal());
+      await flush();
+      expect(strategy.getState()).toBe(StrategyState.LEG1_PENDING);
+
+      // handleNewRound fires while mid-cycle
+      sdk.dipArb.emit('newRound', {
+        roundId: 'mid-cycle-round',
+        endTime: new Date(Date.now() + 600 * 1000),
+      });
+
+      // State should still be LEG1_PENDING (not corrupted)
+      expect(strategy.getState()).toBe(StrategyState.LEG1_PENDING);
+      expect(strategy.getCurrentRound()).toBe('mid-cycle-round'); // Round ID updates are fine
+      await strategy.stop();
+    });
+
+    it('should reset normally when not mid-cycle', async () => {
+      const { sdk, strategy } = await setupReady();
+
+      // WATCHING state — handleNewRound should reset normally
+      sdk.dipArb.emit('newRound', {
+        roundId: 'fresh-round',
+        endTime: new Date(Date.now() + 600 * 1000),
+      });
+
+      expect(strategy.getCurrentRound()).toBe('fresh-round');
+
+      // Should be able to process a new signal (cycleAttemptedThisRound was reset)
+      const leg1Events = collectEvents(strategy, 'leg1Executed');
+      sdk.dipArb.emit('signal', makeLeg1Signal());
+      await flush();
+      expect(leg1Events).toHaveLength(1);
+      await strategy.stop();
+    });
+  });
+
+  // ── Fix #5: handleStarted cancels live orders ─────────────────────────
+
+  describe('fix #5 — handleStarted cancels outstanding live orders', () => {
+    it('should cancel pending orders from previous market on rotation', async () => {
+      const { sdk, strategy } = await setupReady({
+        trading: { ...makeConfig().trading, useMakerOrders: false, makerFallbackToTaker: true },
+        paper: { enabled: false, startingBalance: 1000, simulateFees: true, simulateSlippage: true, slippagePct: 0.02, logFile: 'test.jsonl', recordData: false, dataDir: 'data', recordIntervalMs: 1000 },
+      });
+
+      // FOK leg1 fill → places exit sell
+      sdk.tradingService.createMarketOrder.mockResolvedValue({ success: true, orderId: 'fok-1' });
+      sdk.tradingService.createLimitOrder.mockResolvedValue({ orderId: 'exit-sell-1' });
+      sdk.dipArb.emit('signal', makeLeg1Signal());
+      await flush();
+      expect(strategy.getState()).toBe(StrategyState.WAITING_FOR_HEDGE);
+
+      // Clear mocks
+      sdk.tradingService.cancelOrder.mockClear();
+
+      // Market rotation: handleStarted fires
+      emitStarted(sdk, { slug: 'new-market-2' });
+
+      // Should have cancelled the exit sell order from the previous market
+      expect(sdk.tradingService.cancelOrder).toHaveBeenCalledWith('exit-sell-1');
+      expect(strategy.getState()).toBe(StrategyState.WATCHING);
+      await strategy.stop();
+    });
+
+    it('should not cancel orders in paper mode', async () => {
+      const { sdk, strategy } = await setupReady(); // paper mode
+
+      sdk.dipArb.emit('signal', makeLeg1Signal());
+      await flush();
+
+      sdk.tradingService.cancelOrder.mockClear();
+      emitStarted(sdk, { slug: 'new-market' });
+
+      // No cancelOrder calls in paper mode
+      expect(sdk.tradingService.cancelOrder).not.toHaveBeenCalled();
+      await strategy.stop();
+    });
+  });
+
+  // ── Fix #6: handleRoundComplete doesn't double-count ──────────────────
+
+  describe('fix #6 — handleRoundComplete does not double-count stats', () => {
+    it('should skip stats when finalizeLiveCycle already counted', async () => {
+      const { sdk, strategy } = await setupReady({
+        paper: { enabled: false, startingBalance: 1000, simulateFees: true, simulateSlippage: true, slippagePct: 0.02, logFile: 'test.jsonl', recordData: false, dataDir: 'data', recordIntervalMs: 1000 },
+      });
+
+      // Complete cycle via handleExecution (finalizeLiveCycle counts stats)
+      const leg1Id = 'dc-leg1';
+      const leg2Id = 'dc-leg2';
+      (strategy as any).expectedOrderIds.add(leg1Id);
+      (strategy as any).expectedOrderIds.add(leg2Id);
+
+      sdk.dipArb.emit('execution', {
+        leg: 'leg1', success: true, side: 'UP', price: 0.40, shares: 50,
+        tokenId: 'up-token-123', orderId: leg1Id,
+      });
+      await flush();
+
+      sdk.dipArb.emit('execution', {
+        leg: 'leg2', success: true, side: 'DOWN', price: 0.50, shares: 50,
+        tokenId: 'down-token-456', orderId: leg2Id,
+      });
+      await flush();
+
+      // finalizeLiveCycle should have counted 1 completed cycle
+      expect(strategy.getStats().cyclesCompleted).toBe(1);
+
+      // Now handleRoundComplete fires (SDK event)
+      sdk.dipArb.emit('roundComplete', { status: 'completed', profit: 5 });
+      await flush();
+
+      // Should still be 1, NOT 2
+      expect(strategy.getStats().cyclesCompleted).toBe(1);
+      await strategy.stop();
+    });
+
+    it('should count stats when finalizeLiveCycle did not run', async () => {
+      const { sdk, strategy } = await setupReady();
+
+      // handleRoundComplete without a prior finalizeLiveCycle
+      sdk.dipArb.emit('roundComplete', { status: 'completed', profit: 7 });
+      await flush();
+
+      expect(strategy.getStats().cyclesCompleted).toBe(1);
+      expect(strategy.getStats().totalProfit.toNumber()).toBe(7);
+      await strategy.stop();
+    });
+  });
+
+  // ── Fix #7: Payout uses min(leg1, leg2) shares for partial fills ──────
+
+  describe('fix #7 — payout uses min shares for partial fills', () => {
+    it('should use leg2 shares when less than leg1 (partial fill)', async () => {
+      const { sdk, strategy } = await setupReady({
+        paper: { enabled: false, startingBalance: 1000, simulateFees: true, simulateSlippage: true, slippagePct: 0.02, logFile: 'test.jsonl', recordData: false, dataDir: 'data', recordIntervalMs: 1000 },
+      });
+      const cycles = collectEvents(strategy, 'cycleComplete');
+
+      const leg1Id = 'pf-leg1';
+      const leg2Id = 'pf-leg2';
+      (strategy as any).expectedOrderIds.add(leg1Id);
+      (strategy as any).expectedOrderIds.add(leg2Id);
+
+      // Leg1: 100 shares at $0.40
+      sdk.dipArb.emit('execution', {
+        leg: 'leg1', success: true, side: 'UP', price: 0.40, shares: 100,
+        tokenId: 'up-token-123', orderId: leg1Id,
+      });
+      await flush();
+
+      // Leg2: only 60 shares at $0.50 (partial fill)
+      sdk.dipArb.emit('execution', {
+        leg: 'leg2', success: true, side: 'DOWN', price: 0.50, shares: 60,
+        tokenId: 'down-token-456', orderId: leg2Id,
+      });
+      await flush();
+
+      expect(cycles).toHaveLength(1);
+      // payout = min(100, 60) = 60 (not 100)
+      // totalCost = 0.40*100 + 0.50*60 = 40 + 30 = 70
+      // profit = 60 - 70 = -10
+      expect(cycles[0].payout.toNumber()).toBe(60);
+      expect(cycles[0].totalCost.toNumber()).toBe(70);
+      expect(cycles[0].profit.toNumber()).toBe(-10);
+      await strategy.stop();
+    });
+
+    it('should use full shares when both legs match (paper mode)', async () => {
+      const { sdk, strategy } = await setupReady();
+      const cycles = collectEvents(strategy, 'cycleComplete');
+
+      sdk.dipArb.emit('signal', makeLeg1Signal({ currentPrice: 0.40 }));
+      await flush();
+      sdk.dipArb.emit('signal', makeLeg2Signal({ currentPrice: 0.50 }));
+      await flush();
+
+      // Both legs have same shares (100), so payout = 100
+      expect(cycles[0].payout.toNumber()).toBe(100);
+      await strategy.stop();
+    });
+  });
+
+  // ── Fix #8: Fill poll overlap guard ────────────────────────────────────
+
+  describe('fix #8 — fill poll prevents overlapping async callbacks', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('should not call getOrder twice concurrently when previous poll is slow', async () => {
+      const sdk = createMockSdk();
+      const config = makeConfig({
+        paper: { enabled: false, startingBalance: 1000, simulateFees: true, simulateSlippage: true, slippagePct: 0.02, logFile: 'test.jsonl', recordData: false, dataDir: 'data', recordIntervalMs: 1000 },
+        trading: { ...makeConfig().trading, gtcPollIntervalMs: 50 },
+      });
+      const strategy = new EnhancedDipArbStrategy(sdk, config);
+      await strategy.start();
+      emitStarted(sdk);
+      populateOrderbook(sdk);
+
+      sdk.tradingService.createLimitOrder.mockResolvedValue({ orderId: 'slow-order' });
+
+      // Make getOrder slow — takes 200ms (4x poll interval of 50ms)
+      let getOrderCallCount = 0;
+      sdk.tradingService.getOrder.mockImplementation(() => {
+        getOrderCallCount++;
+        return new Promise(resolve =>
+          setTimeout(() => resolve({ orderId: 'slow-order', status: 'open' }), 200),
+        );
+      });
+
+      sdk.dipArb.emit('signal', makeLeg1Signal());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(strategy.getState()).toBe(StrategyState.LEG1_PENDING);
+
+      // Advance 250ms — should have triggered 5 poll ticks (50ms each)
+      // But with the overlap guard, only 1-2 should actually call getOrder
+      getOrderCallCount = 0;
+      await vi.advanceTimersByTimeAsync(250);
+
+      // Without the guard, all 5 ticks would call getOrder
+      // With the guard, only ~1-2 should run (first runs, rest are skipped)
+      expect(getOrderCallCount).toBeLessThanOrEqual(2);
+      await strategy.stop();
+    });
+  });
+
+  // ── Fix #9: Live balance tracking ──────────────────────────────────────
+
+  describe('fix #9 — live balance tracking', () => {
+    it('should query CLOB balance on live start', async () => {
+      const sdk = createMockSdk();
+      sdk.tradingService.getBalanceAllowance = vi.fn().mockResolvedValue({
+        balance: '542.50',
+        allowance: '10000',
+      });
+      const config = makeConfig({
+        paper: { enabled: false, startingBalance: 1000, simulateFees: true, simulateSlippage: true, slippagePct: 0.02, logFile: 'test.jsonl', recordData: false, dataDir: 'data', recordIntervalMs: 1000 },
+        trading: { ...makeConfig().trading, useMakerOrders: false, makerFallbackToTaker: true },
+      });
+      const strategy = new EnhancedDipArbStrategy(sdk, config);
+      await strategy.start();
+
+      expect(sdk.tradingService.getBalanceAllowance).toHaveBeenCalledWith('COLLATERAL');
+
+      // Position sizing should use queried balance ($542.50)
+      // 5% of $542.50 = $27.125, $27.125/0.40 = 67 shares
+      emitStarted(sdk);
+      populateOrderbook(sdk);
+
+      // FOK returns success
+      sdk.tradingService.createMarketOrder.mockResolvedValue({ success: true, orderId: 'fok-1' });
+      sdk.tradingService.createLimitOrder.mockResolvedValue({ orderId: 'sell-1' });
+
+      const leg1Events = collectEvents(strategy, 'leg1Executed');
+      sdk.dipArb.emit('signal', makeLeg1Signal({ currentPrice: 0.40 }));
+      await flush();
+
+      expect(leg1Events).toHaveLength(1);
+      expect(leg1Events[0].shares.toNumber()).toBe(67);
+      await strategy.stop();
+    });
+
+    it('should not query balance in paper mode', async () => {
+      const sdk = createMockSdk();
+      sdk.tradingService.getBalanceAllowance = vi.fn();
+      const config = makeConfig(); // paper mode
+      const strategy = new EnhancedDipArbStrategy(sdk, config);
+      await strategy.start();
+
+      expect(sdk.tradingService.getBalanceAllowance).not.toHaveBeenCalled();
+      await strategy.stop();
+    });
+
+    it('should handle balance query failure gracefully', async () => {
+      const sdk = createMockSdk();
+      sdk.tradingService.getBalanceAllowance = vi.fn().mockRejectedValue(new Error('RPC timeout'));
+      const config = makeConfig({
+        paper: { enabled: false, startingBalance: 1000, simulateFees: true, simulateSlippage: true, slippagePct: 0.02, logFile: 'test.jsonl', recordData: false, dataDir: 'data', recordIntervalMs: 1000 },
+      });
+      const strategy = new EnhancedDipArbStrategy(sdk, config);
+      const errors = collectEvents(strategy, 'error');
+
+      // Should not throw
+      await strategy.start();
+
+      // Should not emit error — just log a warning internally
+      expect(errors).toHaveLength(0);
+      await strategy.stop();
+    });
+  });
+
+  // ── Fix #10: Price validation before placing orders ────────────────────
+
+  describe('fix #10 — price validation before placing orders', () => {
+    it('should reject leg1 with price <= 0', async () => {
+      const { sdk, strategy } = await setupReady({
+        paper: { enabled: false, startingBalance: 1000, simulateFees: true, simulateSlippage: true, slippagePct: 0.02, logFile: 'test.jsonl', recordData: false, dataDir: 'data', recordIntervalMs: 1000 },
+        trading: { ...makeConfig().trading, useMakerOrders: false, makerFallbackToTaker: true },
+      });
+      const leg1Events = collectEvents(strategy, 'leg1Executed');
+
+      // Signal with price 0 (corrupt data)
+      sdk.dipArb.emit('signal', makeLeg1Signal({ currentPrice: 0, targetPrice: 0 }));
+      await flush();
+
+      expect(leg1Events).toHaveLength(0);
+      expect(strategy.getState()).toBe(StrategyState.WATCHING);
+      // Should not have called createMarketOrder
+      expect(sdk.tradingService.createMarketOrder).not.toHaveBeenCalled();
+      await strategy.stop();
+    });
+
+    it('should reject leg1 with price >= 1', async () => {
+      const { sdk, strategy } = await setupReady({
+        paper: { enabled: false, startingBalance: 1000, simulateFees: true, simulateSlippage: true, slippagePct: 0.02, logFile: 'test.jsonl', recordData: false, dataDir: 'data', recordIntervalMs: 1000 },
+        trading: { ...makeConfig().trading, useMakerOrders: false, makerFallbackToTaker: true },
+      });
+      const leg1Events = collectEvents(strategy, 'leg1Executed');
+
+      sdk.dipArb.emit('signal', makeLeg1Signal({ currentPrice: 1.0, targetPrice: 1.0 }));
+      await flush();
+
+      expect(leg1Events).toHaveLength(0);
+      expect(sdk.tradingService.createMarketOrder).not.toHaveBeenCalled();
+      await strategy.stop();
+    });
+
+    it('should reject leg2 GTC with invalid limit price', async () => {
+      const { sdk, strategy } = await setupReady({
+        paper: { enabled: false, startingBalance: 1000, simulateFees: true, simulateSlippage: true, slippagePct: 0.02, logFile: 'test.jsonl', recordData: false, dataDir: 'data', recordIntervalMs: 1000 },
+      });
+
+      // Set up leg1 via handleExecution
+      const leg1Id = 'valid-leg1';
+      (strategy as any).expectedOrderIds.add(leg1Id);
+      sdk.dipArb.emit('execution', {
+        leg: 'leg1', success: true, side: 'UP', price: 0.40, shares: 100,
+        tokenId: 'up-token-123', orderId: leg1Id,
+      });
+      await flush();
+      expect(strategy.getState()).toBe(StrategyState.WAITING_FOR_HEDGE);
+
+      // Clear upAsks so bestAsk falls back to signal price (which we set to 0)
+      sdk.dipArb.downAsks = [];
+      sdk.dipArb.realtimeService.bookCache.delete('down-token-456');
+
+      sdk.tradingService.createLimitOrder.mockClear();
+
+      // Leg2 signal with price 0 — should be rejected by validation
+      sdk.dipArb.emit('signal', makeLeg2Signal({ currentPrice: 0 }));
+      await flush();
+
+      // createLimitOrder should NOT have been called for leg2
+      // (it may have been called earlier for leg1 GTC sell)
+      const leg2BuyCalls = sdk.tradingService.createLimitOrder.mock.calls.filter(
+        (c: any[]) => c[0]?.side === 'BUY',
+      );
+      expect(leg2BuyCalls).toHaveLength(0);
+      await strategy.stop();
+    });
+
+    it('should accept valid prices in range (0, 1)', async () => {
+      const { sdk, strategy } = await setupReady({
+        paper: { enabled: false, startingBalance: 1000, simulateFees: true, simulateSlippage: true, slippagePct: 0.02, logFile: 'test.jsonl', recordData: false, dataDir: 'data', recordIntervalMs: 1000 },
+        trading: { ...makeConfig().trading, useMakerOrders: false, makerFallbackToTaker: true },
+      });
+
+      sdk.tradingService.createMarketOrder.mockResolvedValue({ success: true, orderId: 'fok-1' });
+      sdk.tradingService.createLimitOrder.mockResolvedValue({ orderId: 'sell-1' });
+
+      const leg1Events = collectEvents(strategy, 'leg1Executed');
+      sdk.dipArb.emit('signal', makeLeg1Signal({ currentPrice: 0.40 }));
+      await flush();
+
+      expect(leg1Events).toHaveLength(1);
       await strategy.stop();
     });
   });
