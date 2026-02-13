@@ -144,11 +144,13 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     const sdkUnderlyings = assets as ('BTC' | 'ETH' | 'SOL' | 'XRP')[];
     const sdkDuration = duration as '5m' | '15m';
     this.sdk.dipArb.enableAutoRotate({
+      enabled: true,
       underlyings: sdkUnderlyings,
       duration: sdkDuration,
       autoSettle: true,
       settleStrategy: 'redeem',
       preloadMinutes: 2,
+      redeemWaitMinutes: 5,
     });
 
     // Find and start a market — retry up to 3 times if none found
@@ -1175,6 +1177,37 @@ export class EnhancedDipArbStrategy extends EventEmitter {
   }
 
   /**
+   * Fetch a single token's orderbook directly from CLOB REST API.
+   * Uses native fetch instead of SDK's CLOB client to avoid noisy error logging.
+   */
+  private async fetchBookDirect(tokenId: string): Promise<{ bids: any[]; asks: any[] } | null> {
+    try {
+      const url = `${this.config.api.clobEndpoint}/book?token_id=${tokenId}`;
+      const res = await fetch(url, {
+        headers: { 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) return null;
+      const data = await res.json() as { bids: any[]; asks: any[] };
+
+      // CLOB REST returns bids ascending (worst first) and asks descending
+      // (worst first). Sort so index [0] = best price for both:
+      //   bids: descending (highest/best first)
+      //   asks: ascending  (lowest/best first)
+      if (data.bids?.length > 1) {
+        data.bids.sort((a: any, b: any) => Number(b.price) - Number(a.price));
+      }
+      if (data.asks?.length > 1) {
+        data.asks.sort((a: any, b: any) => Number(a.price) - Number(b.price));
+      }
+
+      return data;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * REST fallback — fetch orderbook via CLOB REST API when WebSocket
    * subscription fails to deliver data after market rotation.
    *
@@ -1188,12 +1221,9 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
     this.restFetchInFlight = true;
     try {
-      const marketsService = (this.sdk as any).markets;
-      if (!marketsService?.getTokenOrderbook) return;
-
       const [upBook, downBook] = await Promise.all([
-        marketsService.getTokenOrderbook(this.currentUpTokenId).catch(() => null),
-        marketsService.getTokenOrderbook(this.currentDownTokenId).catch(() => null),
+        this.fetchBookDirect(this.currentUpTokenId),
+        this.fetchBookDirect(this.currentDownTokenId),
       ]);
 
       const dipArb = this.sdk.dipArb as any;
@@ -1221,6 +1251,13 @@ export class EnhancedDipArbStrategy extends EventEmitter {
         if (realtimeService?.bookCache) {
           realtimeService.bookCache.set(this.currentDownTokenId, downBook);
         }
+      }
+
+      // Log first successful REST fetch per round for debugging
+      if ((upBook?.asks?.length || downBook?.asks?.length) && this.pricePollTicks < 20) {
+        this.log('debug',
+          `REST fetch: UP=${upBook?.asks?.length ?? 0} asks, DOWN=${downBook?.asks?.length ?? 0} asks`,
+        );
       }
     } catch {
       // Silently swallow — REST poll will retry on next tick

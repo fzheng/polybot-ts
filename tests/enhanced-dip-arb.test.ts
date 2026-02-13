@@ -1553,34 +1553,38 @@ describe('EnhancedDipArbStrategy', () => {
       emitStarted(sdk);
       // handleStarted clears caches; don't repopulate — simulate WS failure
 
-      // Configure REST mock to return fresh data for the new tokens
-      sdk.markets.getTokenOrderbook.mockImplementation((tokenId: string) => {
-        if (tokenId === 'up-token-123') {
-          return Promise.resolve({
+      // Mock global fetch to return orderbook data for our token IDs
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+        const url = typeof input === 'string' ? input : input.url;
+        if (url.includes('up-token-123')) {
+          return new Response(JSON.stringify({
             bids: [{ price: 0.42, size: 200 }],
             asks: [{ price: 0.43, size: 150 }],
-          });
+          }), { status: 200 });
         }
-        if (tokenId === 'down-token-456') {
-          return Promise.resolve({
+        if (url.includes('down-token-456')) {
+          return new Response(JSON.stringify({
             bids: [{ price: 0.52, size: 200 }],
             asks: [{ price: 0.53, size: 150 }],
-          });
+          }), { status: 200 });
         }
-        return Promise.resolve(null);
+        return new Response(null, { status: 404 });
       });
 
       // Wait for the 5s REST poll timer to fire + buffer for async REST fetch
       await new Promise(r => setTimeout(r, 5500));
 
-      // REST should have been called for both tokens
-      expect(sdk.markets.getTokenOrderbook).toHaveBeenCalledWith('up-token-123');
-      expect(sdk.markets.getTokenOrderbook).toHaveBeenCalledWith('down-token-456');
+      // fetch should have been called for both tokens
+      expect(fetchSpy).toHaveBeenCalled();
+      const urls = fetchSpy.mock.calls.map(c => String(c[0]));
+      expect(urls.some(u => u.includes('up-token-123'))).toBe(true);
+      expect(urls.some(u => u.includes('down-token-456'))).toBe(true);
 
-      // SDK caches should now be populated from REST data
+      // SDK caches should now be populated from REST data via handleOrderbookUpdate
       expect(sdk.dipArb.upAsks).toEqual([{ price: 0.43, size: 150 }]);
       expect(sdk.dipArb.downAsks).toEqual([{ price: 0.53, size: 150 }]);
 
+      fetchSpy.mockRestore();
       await strategy.stop();
     });
   });
