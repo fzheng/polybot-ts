@@ -282,8 +282,10 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     this.emit('newRound', { slug, secondsRemaining: remaining });
 
     // Store token IDs for reading bids from bookCache in the price poll.
-    this.currentUpTokenId = event.upTokenId;
-    this.currentDownTokenId = event.downTokenId;
+    // Prefer event fields; fall back to dipArb.market (already set before 'started' fires).
+    const dipArbMarket = (this.sdk.dipArb as any).market;
+    this.currentUpTokenId = event.upTokenId ?? dipArbMarket?.upTokenId;
+    this.currentDownTokenId = event.downTokenId ?? dipArbMarket?.downTokenId;
     this.upBids = [];
     this.downBids = [];
 
@@ -305,7 +307,10 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     // subscription) — no separate orderbook subscription needed.
     this.startPricePoll();
 
-    this.log('info', `New market: ${slug} — https://polymarket.com/event/${slug}`);
+    this.log('info',
+      `New market: ${slug} — https://polymarket.com/event/${slug} ` +
+      `(UP=${this.currentUpTokenId?.slice(-8) ?? 'none'}, DOWN=${this.currentDownTokenId?.slice(-8) ?? 'none'})`,
+    );
   }
 
   /**
@@ -683,6 +688,10 @@ export class EnhancedDipArbStrategy extends EventEmitter {
   }
 
   private async handleRoundComplete(result: any): Promise<void> {
+    // Stop polling immediately — token IDs become stale once the round resolves.
+    // Without this, the REST fallback fires 404s during the gap between rounds.
+    this.stopPricePoll();
+
     const profit = new Decimal(result.profit ?? 0);
     if (result.status === 'completed') {
       this.stats.cyclesCompleted++;
