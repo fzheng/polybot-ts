@@ -71,20 +71,16 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
   // Continuous price feed for TUI (reads SDK orderbook state)
   private pricePollTimer: ReturnType<typeof setInterval> | null = null;
+  private restPollTimer: ReturnType<typeof setInterval> | null = null;
   private lastPollLogTime = 0;
   private pricePollTicks = 0;
+  private restFetchInFlight = false;    // Prevent overlapping REST fetches
+  private lastPriceHistoryLen = 0;      // Track SDK priceHistory growth to detect live WS
+  private _lastSignalLogTime: Map<string, number> = new Map(); // Throttle signal debug logs
 
-  // Full orderbook top-of-book (bids captured from realtimeService since SDK only stores asks)
+  // Bid data read from realtimeService.bookCache in price poll (SDK only stores asks internally)
   private upBids: Array<{ price: number; size: number }> = [];
   private downBids: Array<{ price: number; size: number }> = [];
-  private orderbookSubscription: { unsubscribe: () => void } | null = null;
-
-  // Guards against displaying stale prices from previous market.
-  // SDK doesn't clear upAsks/downAsks on start(), so after rotation we'd
-  // read old prices until the first WebSocket orderbook snapshot arrives.
-  private marketDataReady = false;
-  private marketDataTimer: ReturnType<typeof setTimeout> | null = null;
-  private marketDataRetries = 0;
   private currentUpTokenId: string | undefined;
   private currentDownTokenId: string | undefined;
 
@@ -193,8 +189,6 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     this.clearEmergencyTimer();
     this.clearFillPollTimer();
     this.stopPricePoll();
-    this.unsubscribeOrderbookBids();
-    if (this.marketDataTimer) { clearTimeout(this.marketDataTimer); this.marketDataTimer = null; }
     // Cancel any outstanding exit sell orders on stop
     if (!this.config.paper.enabled) {
       for (const orderId of [this.leg1SellOrderId, this.leg2SellOrderId]) {
@@ -287,20 +281,28 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
     this.emit('newRound', { slug, secondsRemaining: remaining });
 
-    // Mark price data as stale until the first WebSocket orderbook event arrives.
-    // SDK doesn't clear upAsks/downAsks on start(), so we'd show old prices otherwise.
-    this.marketDataReady = false;
-    this.marketDataRetries = 0;
+    // Store token IDs for reading bids from bookCache in the price poll.
     this.currentUpTokenId = event.upTokenId;
     this.currentDownTokenId = event.downTokenId;
-    if (this.marketDataTimer) { clearTimeout(this.marketDataTimer); this.marketDataTimer = null; }
-    this.scheduleOrderbookRetry();
+    this.upBids = [];
+    this.downBids = [];
 
-    // Subscribe to realtimeService orderbook events for bid data
-    // Pass token IDs from the event directly to avoid race with SDK internal state
-    this.subscribeOrderbookBids(event.upTokenId, event.downTokenId);
+    // Flush stale orderbook data left over from the previous market.
+    // The SDK does NOT clear these caches on rotation — bookCache retains
+    // resolved prices ($0.01/$0.99) and upAsks/downAsks keep old levels.
+    const dipArb = this.sdk.dipArb as any;
+    const realtimeService = dipArb?.realtimeService;
+    if (realtimeService?.bookCache) {
+      realtimeService.bookCache.clear();
+    }
+    if (dipArb) {
+      dipArb.upAsks = [];
+      dipArb.downAsks = [];
+    }
 
-    // Start/restart continuous price polling
+    // Start/restart continuous price polling.
+    // Bids are read from realtimeService.bookCache (populated by the SDK's own
+    // subscription) — no separate orderbook subscription needed.
     this.startPricePoll();
 
     this.log('info', `New market: ${slug} — https://polymarket.com/event/${slug}`);
@@ -359,6 +361,20 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       this.lastSecondsRemaining = secondsRemaining;
     }
 
+    // Log every signal received from the SDK (throttled: once per 30s per type)
+    const sigKey = `${signal.type}_${signal.source ?? 'dip'}`;
+    const now = Date.now();
+    if (!this._lastSignalLogTime) this._lastSignalLogTime = new Map();
+    const lastLog = this._lastSignalLogTime.get(sigKey) ?? 0;
+    if (now - lastLog > 30_000) {
+      this._lastSignalLogTime.set(sigKey, now);
+      this.log('debug',
+        `SIGNAL: type=${signal.type} source=${signal.source ?? 'dip'} ` +
+        `side=${signal.dipSide} price=$${Number(signal.currentPrice).toFixed(4)} ` +
+        `drop=${((signal.dropPercent ?? 0) * 100).toFixed(1)}% state=${this.state}`,
+      );
+    }
+
     // Only handle Leg 1 signals when we're watching
     if (signal.type === 'leg1') {
       await this.handleLeg1Signal(signal);
@@ -385,7 +401,8 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       const secsLeft = Math.max(0, Math.round((this.marketEndTimeMs - Date.now()) / 1000));
       const minRequired = this.config.risk.exitBeforeExpiryMinutes * 60;
       if (secsLeft <= minRequired) {
-        return; // Too close to expiry — logged silently to avoid spam
+        this.log('debug', `GATE 2 REJECT: ${secsLeft}s left < ${minRequired}s required`);
+        return;
       }
     }
 
@@ -401,40 +418,18 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     // because DOWN surged 25% from $0.04→$0.05). The dropPercent field is overloaded
     // and doesn't represent an actual dip of the buying side.
     if (signalSource !== 'dip') {
+      this.log('debug', `GATE 4 REJECT: source=${signalSource} (only 'dip' accepted)`);
       return;
     }
 
-    // ── Gate 5: Spread width check ─────────────────────────────────
-    // Uses our own orderbook subscription for bids + SDK's internal asks.
-    // SDK signals don't carry bestBid/bestAsk, so we source them ourselves.
-    {
-      const leg1Bids = side === Side.UP ? this.upBids : this.downBids;
-      const dipArbRef = this.sdk.dipArb as any;
-      const leg1Asks = side === Side.UP ? dipArbRef.upAsks : dipArbRef.downAsks;
-      const bookBid = leg1Bids[0]?.price ?? 0;
-      const bookAsk = leg1Asks?.[0]?.price ? Number(leg1Asks[0].price) : 0;
-
-      if (bookBid > 0 && bookAsk > 0) {
-        const spreadPct = (bookAsk - bookBid) / bookBid;
-        if (spreadPct > this.config.trading.maxSpreadPct) {
-          this.log('warn',
-            `SPREAD SKIP: spread=${(spreadPct * 100).toFixed(1)}% ` +
-            `(bid=$${bookBid.toFixed(4)}, ask=$${bookAsk.toFixed(4)}) > ` +
-            `max ${(this.config.trading.maxSpreadPct * 100).toFixed(0)}%`,
-          );
-          return;
-        }
-      }
-    }
-
-    // ── Gate 6: Circuit breaker ────────────────────────────────────
+    // ── Gate 5: Circuit breaker ────────────────────────────────────
     if (this.positionSizer.isTradingPaused()) {
       const reason = this.positionSizer.getPauseReason();
       this.log('warn', `CIRCUIT BREAKER: ${reason}`);
       return;
     }
 
-    // ── Gate 7: Position sizing ────────────────────────────────────
+    // ── Gate 6: Position sizing ────────────────────────────────────
     const shares = this.positionSizer.calculateShares(
       this.currentBalance,
       currentPrice.toNumber(),
@@ -444,7 +439,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       return;
     }
 
-    // ── Gate 8: Fee-aware order type ────────────────────────────────
+    // ── Gate 7: Fee-aware order type ────────────────────────────────
     const orderType = this.orderPlacer.decideLeg1OrderType(
       currentPrice.toNumber(),
       oppositeAsk.toNumber(),
@@ -466,7 +461,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       if (this.config.paper.enabled) {
         // Paper mode — emit for paper trader to handle
         // Use real orderbook data for paper LegInfo (for accurate slippage simulation)
-        const leg1Bids = side === Side.UP ? this.upBids : this.downBids;
+        const leg1Bids = this.getBids(side);
         const leg1DipArb = this.sdk.dipArb as any;
         const leg1Asks = side === Side.UP ? leg1DipArb.upAsks : leg1DipArb.downAsks;
         const paperBid = leg1Bids[0]?.price ?? 0;
@@ -525,7 +520,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     try {
       if (this.config.paper.enabled) {
         // Use real orderbook data for paper LegInfo (for accurate slippage simulation)
-        const hedgeBids = hedgeSide === Side.UP ? this.upBids : this.downBids;
+        const hedgeBids = this.getBids(hedgeSide);
         const hedgeDipArb = this.sdk.dipArb as any;
         const hedgeAsks = hedgeSide === Side.UP ? hedgeDipArb.upAsks : hedgeDipArb.downAsks;
         const hedgeBid = hedgeBids[0]?.price ?? 0;
@@ -734,8 +729,8 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
     const side: Side = signal.dipSide === 'UP' ? Side.UP : Side.DOWN;
 
-    // Use real orderbook bid/ask from our subscription
-    const bids = side === Side.UP ? this.upBids : this.downBids;
+    // Use real orderbook bid/ask from bookCache
+    const bids = this.getBids(side);
     const dipArb = this.sdk.dipArb as any;
     const asks = side === Side.UP ? dipArb.upAsks : dipArb.downAsks;
     const bestBid = signal.bestBid ?? bids[0]?.price ?? 0;
@@ -818,7 +813,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
     // Use real orderbook data for the hedge side
     const hedgeSide = this.leg1!.side === Side.UP ? Side.DOWN : Side.UP;
-    const bids = hedgeSide === Side.UP ? this.upBids : this.downBids;
+    const bids = this.getBids(hedgeSide);
     const dipArb = this.sdk.dipArb as any;
     const asks = hedgeSide === Side.UP ? dipArb.upAsks : dipArb.downAsks;
     const bestBid = signal.bestBid ?? bids[0]?.price ?? 0;
@@ -1033,102 +1028,44 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     }
   }
 
-  // ── Orderbook Subscription (for bid data) ─────────────────────────────
-
-  /**
-   * Subscribe to realtimeService 'orderbook' events to capture bid data.
-   * The SDK's DipArbService only stores asks; we need bids for TUI display
-   * and proper limit order pricing.
-   *
-   * @param upId - UP token ID (pass from 'started' event to avoid stale dipArb.market)
-   * @param downId - DOWN token ID
-   */
-  private scheduleOrderbookRetry(): void {
-    this.marketDataTimer = setTimeout(() => {
-      if (this.marketDataReady) return;
-      this.marketDataRetries++;
-      if (this.marketDataRetries > 3) {
-        this.log('warn', 'No orderbook data after 3 retries — price display may be stale');
-        return;
-      }
-      this.log('warn', `No orderbook data after ${this.marketDataRetries * 10}s — re-subscribing (attempt ${this.marketDataRetries}/3)`);
-      // Re-subscribe via the official subscribeMarkets() API.
-      // This sends a fresh WebSocket subscription message to the server.
-      this.subscribeOrderbookBids(this.currentUpTokenId, this.currentDownTokenId);
-      this.scheduleOrderbookRetry();
-    }, 10_000);
-  }
-
-  private subscribeOrderbookBids(upId?: string, downId?: string): void {
-    this.unsubscribeOrderbookBids();
-
-    const dipArb = this.sdk.dipArb as any;
-    const realtimeService = dipArb?.realtimeService;
-    const market = dipArb?.market;
-
-    // Prefer token IDs passed from the event; fall back to SDK's internal market
-    const upTokenId = upId ?? market?.upTokenId;
-    const downTokenId = downId ?? market?.downTokenId;
-
-    if (!realtimeService || !upTokenId || !downTokenId) {
-      this.log('warn', 'Cannot subscribe to orderbook bids: realtimeService or token IDs not available');
-      return;
-    }
-
-    // Use the official subscribeMarkets() API with onOrderbook handler.
-    // This is the same mechanism the SDK's DipArbService uses internally.
-    // Raw EventEmitter listeners (realtimeService.on('orderbook')) can miss
-    // events across WebSocket reconnections; subscribeMarkets() handles
-    // reconnection re-subscription automatically.
-    this.orderbookSubscription = realtimeService.subscribeMarkets(
-      [upTokenId, downTokenId],
-      {
-        onOrderbook: (book: any) => {
-          const tokenId = book.assetId ?? book.tokenId;
-          if (tokenId === upTokenId && book.bids) {
-            this.upBids = book.bids.map((l: any) => ({ price: Number(l.price), size: Number(l.size) }));
-            if (!this.marketDataReady) {
-              this.marketDataReady = true;
-            }
-          } else if (tokenId === downTokenId && book.bids) {
-            this.downBids = book.bids.map((l: any) => ({ price: Number(l.price), size: Number(l.size) }));
-            if (!this.marketDataReady) {
-              this.marketDataReady = true;
-            }
-          }
-        },
-      },
-    );
-  }
-
-  private unsubscribeOrderbookBids(): void {
-    if (this.orderbookSubscription) {
-      this.orderbookSubscription.unsubscribe();
-      this.orderbookSubscription = null;
-    }
-    this.upBids = [];
-    this.downBids = [];
-  }
-
   // ── Continuous Price Feed ─────────────────────────────────────────────
 
   /**
+   * Read bids for a token from realtimeService.bookCache and update local cache.
+   * Falls back to this.upBids/downBids if bookCache unavailable.
+   */
+  private getBids(side: Side): Array<{ price: number; size: number }> {
+    const dipArb = this.sdk.dipArb as any;
+    const realtimeService = dipArb?.realtimeService;
+    const tokenId = side === Side.UP ? this.currentUpTokenId : this.currentDownTokenId;
+
+    if (realtimeService && tokenId) {
+      const book = realtimeService.getBook?.(tokenId) ?? realtimeService.bookCache?.get(tokenId);
+      if (book?.bids?.length > 0) {
+        const bids = book.bids.map((l: any) => ({ price: Number(l.price), size: Number(l.size) }));
+        if (side === Side.UP) this.upBids = bids; else this.downBids = bids;
+        return bids;
+      }
+    }
+    return side === Side.UP ? this.upBids : this.downBids;
+  }
+
+  /**
    * Poll SDK's internal orderbook state every 500ms and emit priceUpdate
-   * events for the TUI. Reads asks from SDK + bids from our orderbook subscription.
+   * events for the TUI. Reads all data from the SDK's own caches —
+   * asks from dipArb.upAsks/downAsks, bids from realtimeService.bookCache.
    */
   private startPricePoll(): void {
     this.stopPricePoll();
     this.pricePollTicks = 0;
     this.lastPollLogTime = Date.now();
+    this.lastPriceHistoryLen = (this.sdk.dipArb as any).priceHistory?.length ?? 0;
 
+    // Main price poll — reads from SDK caches every 500ms
     this.pricePollTimer = setInterval(() => {
       const dipArb = this.sdk.dipArb as any;
+      const realtimeService = dipArb?.realtimeService;
       const now = Date.now();
-
-      // Don't emit stale prices from the previous market.
-      // After market rotation, SDK's upAsks/downAsks retain old data until
-      // the first WebSocket orderbook snapshot arrives for the new tokens.
-      if (!this.marketDataReady) return;
 
       // Read asks from SDK (primary: priceHistory, fallback: upAsks/downAsks)
       const sdkHistory = dipArb.priceHistory as Array<{ timestamp: number; upAsk: number; downAsk: number }> | undefined;
@@ -1148,11 +1085,25 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       const upAskSize = Number(dipArb.upAsks?.[0]?.size) || 0;
       const downAskSize = Number(dipArb.downAsks?.[0]?.size) || 0;
 
-      // Read bids from our orderbook subscription
-      const upBid = this.upBids[0]?.price ?? 0;
-      const upBidSize = this.upBids[0]?.size ?? 0;
-      const downBid = this.downBids[0]?.price ?? 0;
-      const downBidSize = this.downBids[0]?.size ?? 0;
+      // Read bids from realtimeService.bookCache (populated by SDK's own subscription).
+      // This avoids needing a separate WebSocket subscription for bid data.
+      let upBid = 0, upBidSize = 0, downBid = 0, downBidSize = 0;
+      if (realtimeService && this.currentUpTokenId && this.currentDownTokenId) {
+        const upBook = realtimeService.getBook?.(this.currentUpTokenId)
+                    ?? realtimeService.bookCache?.get(this.currentUpTokenId);
+        const downBook = realtimeService.getBook?.(this.currentDownTokenId)
+                      ?? realtimeService.bookCache?.get(this.currentDownTokenId);
+        if (upBook?.bids?.[0]) {
+          upBid = Number(upBook.bids[0].price) || 0;
+          upBidSize = Number(upBook.bids[0].size) || 0;
+          this.upBids = upBook.bids.map((l: any) => ({ price: Number(l.price), size: Number(l.size) }));
+        }
+        if (downBook?.bids?.[0]) {
+          downBid = Number(downBook.bids[0].price) || 0;
+          downBidSize = Number(downBook.bids[0].size) || 0;
+          this.downBids = downBook.bids.map((l: any) => ({ price: Number(l.price), size: Number(l.size) }));
+        }
+      }
 
       this.pricePollTicks++;
 
@@ -1185,12 +1136,87 @@ export class EnhancedDipArbStrategy extends EventEmitter {
         sum,
       });
     }, 500);
+
+    // REST fallback poll — runs every 5s, checks if WebSocket is alive.
+    // The SDK appends to dipArb.priceHistory on every WebSocket orderbook
+    // message. If priceHistory isn't growing, WebSocket is dead and we
+    // fetch via REST to keep prices updating.
+    this.restPollTimer = setInterval(() => {
+      const dipArb = this.sdk.dipArb as any;
+      const currentLen = dipArb.priceHistory?.length ?? 0;
+      if (currentLen > this.lastPriceHistoryLen) {
+        // WebSocket is alive — priceHistory is growing
+        this.lastPriceHistoryLen = currentLen;
+        return;
+      }
+      this.lastPriceHistoryLen = currentLen;
+      this.fetchOrderbookRest();
+    }, 5000);
   }
 
   private stopPricePoll(): void {
     if (this.pricePollTimer) {
       clearInterval(this.pricePollTimer);
       this.pricePollTimer = null;
+    }
+    if (this.restPollTimer) {
+      clearInterval(this.restPollTimer);
+      this.restPollTimer = null;
+    }
+  }
+
+  /**
+   * REST fallback — fetch orderbook via CLOB REST API when WebSocket
+   * subscription fails to deliver data after market rotation.
+   *
+   * Injects data into the SDK's signal pipeline via handleOrderbookUpdate()
+   * so dip detection works even when WebSocket is dead. Also updates
+   * bookCache for bid display in the TUI price poll.
+   */
+  private async fetchOrderbookRest(): Promise<void> {
+    if (this.restFetchInFlight) return;
+    if (!this.currentUpTokenId || !this.currentDownTokenId) return;
+
+    this.restFetchInFlight = true;
+    try {
+      const marketsService = (this.sdk as any).markets;
+      if (!marketsService?.getTokenOrderbook) return;
+
+      const [upBook, downBook] = await Promise.all([
+        marketsService.getTokenOrderbook(this.currentUpTokenId).catch(() => null),
+        marketsService.getTokenOrderbook(this.currentDownTokenId).catch(() => null),
+      ]);
+
+      const dipArb = this.sdk.dipArb as any;
+      const realtimeService = dipArb?.realtimeService;
+
+      // Inject REST data through the SDK's full signal pipeline:
+      // handleOrderbookUpdate(book) → updates asks → records priceHistory → detectSignal()
+      // This is the same path that WebSocket data takes, enabling dip detection via REST.
+      if (upBook?.asks?.length) {
+        if (typeof dipArb.handleOrderbookUpdate === 'function') {
+          dipArb.handleOrderbookUpdate({ tokenId: this.currentUpTokenId, ...upBook });
+        } else {
+          dipArb.upAsks = upBook.asks;
+        }
+        if (realtimeService?.bookCache) {
+          realtimeService.bookCache.set(this.currentUpTokenId, upBook);
+        }
+      }
+      if (downBook?.asks?.length) {
+        if (typeof dipArb.handleOrderbookUpdate === 'function') {
+          dipArb.handleOrderbookUpdate({ tokenId: this.currentDownTokenId, ...downBook });
+        } else {
+          dipArb.downAsks = downBook.asks;
+        }
+        if (realtimeService?.bookCache) {
+          realtimeService.bookCache.set(this.currentDownTokenId, downBook);
+        }
+      }
+    } catch {
+      // Silently swallow — REST poll will retry on next tick
+    } finally {
+      this.restFetchInFlight = false;
     }
   }
 

@@ -13,18 +13,28 @@ async function flush() {
 }
 
 function createMockSdk() {
-  const realtimeService = Object.assign(new EventEmitter(), {
-    subscribeMarkets: vi.fn((_tokenIds: string[], handlers: any = {}) => {
-      // Mirror SDK behavior: register handler on the EventEmitter filtered by tokenIds
-      const orderbookHandler = (book: any) => {
-        if (_tokenIds.includes(book.assetId ?? book.tokenId)) {
-          handlers.onOrderbook?.(book);
-        }
-      };
-      realtimeService.on('orderbook', orderbookHandler);
-      return { unsubscribe: () => realtimeService.off('orderbook', orderbookHandler) };
-    }),
+  // bookCache stores full orderbook snapshots (bids + asks) keyed by tokenId.
+  // The price poll reads bids from here via getBook() or bookCache.get().
+  const bookCache = new Map<string, any>();
+  bookCache.set('up-token-123', {
+    bids: [{ price: 0.39, size: 50 }],
+    asks: [{ price: 0.40, size: 100 }],
   });
+  bookCache.set('down-token-456', {
+    bids: [{ price: 0.54, size: 50 }],
+    asks: [{ price: 0.55, size: 100 }],
+  });
+
+  const realtimeService = Object.assign(new EventEmitter(), {
+    bookCache,
+    getBook: vi.fn((assetId: string) => bookCache.get(assetId)),
+  });
+
+  const dipArbState = {
+    upAsks: [{ price: 0.40, size: 100 }] as any[],
+    downAsks: [{ price: 0.55, size: 100 }] as any[],
+    priceHistory: [] as any[],
+  };
 
   const dipArb = Object.assign(new EventEmitter(), {
     updateConfig: vi.fn(),
@@ -34,10 +44,20 @@ function createMockSdk() {
     stop: vi.fn(),
     scanUpcomingMarkets: vi.fn().mockResolvedValue([]),
     settle: vi.fn().mockResolvedValue({ success: true, amountReceived: 1.5 }),
+    // Mimics SDK's handleOrderbookUpdate: updates asks + records priceHistory
+    handleOrderbookUpdate: vi.fn((book: any) => {
+      const isUp = book.tokenId === dipArb.market.upTokenId;
+      const isDown = book.tokenId === dipArb.market.downTokenId;
+      if (isUp && book.asks?.length) dipArb.upAsks = book.asks;
+      if (isDown && book.asks?.length) dipArb.downAsks = book.asks;
+      const upAsk = Number(dipArb.upAsks[0]?.price) || 0;
+      const downAsk = Number(dipArb.downAsks[0]?.price) || 0;
+      if (upAsk > 0 && downAsk > 0) {
+        dipArb.priceHistory.push({ timestamp: Date.now(), upAsk, downAsk });
+      }
+    }),
     // Internal state accessed via `as any` by the strategy
-    upAsks: [{ price: 0.40, size: 100 }],
-    downAsks: [{ price: 0.55, size: 100 }],
-    priceHistory: [],
+    ...dipArbState,
     realtimeService,
     market: { upTokenId: 'up-token-123', downTokenId: 'down-token-456' },
   });
@@ -49,7 +69,14 @@ function createMockSdk() {
     cancelOrder: vi.fn().mockResolvedValue(undefined),
   };
 
-  return { dipArb, tradingService } as any;
+  const markets = {
+    getTokenOrderbook: vi.fn().mockResolvedValue({
+      bids: [{ price: 0.39, size: 100 }],
+      asks: [{ price: 0.40, size: 100 }],
+    }),
+  };
+
+  return { dipArb, tradingService, markets } as any;
 }
 
 function makeConfig(overrides: Record<string, any> = {}): BotConfig {
@@ -135,15 +162,17 @@ function emitStarted(sdk: any, overrides: Record<string, any> = {}) {
 }
 
 function populateOrderbook(sdk: any) {
-  // Populate bids via realtimeService (strategy subscribes in handleStarted)
-  sdk.dipArb.realtimeService.emit('orderbook', {
-    assetId: 'up-token-123',
+  // Populate bids via bookCache (strategy reads from here in price poll)
+  sdk.dipArb.realtimeService.bookCache.set('up-token-123', {
     bids: [{ price: 0.39, size: 100 }],
+    asks: [{ price: 0.40, size: 100 }],
   });
-  sdk.dipArb.realtimeService.emit('orderbook', {
-    assetId: 'down-token-456',
+  sdk.dipArb.realtimeService.bookCache.set('down-token-456', {
     bids: [{ price: 0.54, size: 100 }],
   });
+  // Repopulate SDK ask arrays (cleared by handleStarted on rotation)
+  sdk.dipArb.upAsks = [{ price: 0.40, size: 100 }];
+  sdk.dipArb.downAsks = [{ price: 0.55, size: 100 }];
 }
 
 /** Set up a strategy with events wired, a started round, and populated orderbook */
@@ -303,48 +332,6 @@ describe('EnhancedDipArbStrategy', () => {
       sdk.dipArb.emit('signal', makeLeg1Signal());
       await flush();
       expect(leg1Events).toHaveLength(1); // Still 1, no re-entry
-      await strategy.stop();
-    });
-
-    it('should skip when spread is too wide', async () => {
-      const { sdk, strategy } = await setupReady();
-      const leg1Events = collectEvents(strategy, 'leg1Executed');
-
-      // Override asks to create a wide spread: bid=0.39, ask=0.60 → 53.8% spread
-      (sdk.dipArb as any).upAsks = [{ price: 0.60, size: 100 }];
-
-      sdk.dipArb.emit('signal', makeLeg1Signal());
-      await flush();
-      expect(leg1Events).toHaveLength(0); // Filtered out
-      expect(strategy.getState()).toBe(StrategyState.WATCHING);
-      await strategy.stop();
-    });
-
-    it('should pass when spread is narrow', async () => {
-      const { sdk, strategy } = await setupReady();
-      const leg1Events = collectEvents(strategy, 'leg1Executed');
-
-      // bid=0.39, ask=0.40 → 2.6% spread < 10%
-      sdk.dipArb.emit('signal', makeLeg1Signal());
-      await flush();
-      expect(leg1Events).toHaveLength(1);
-      await strategy.stop();
-    });
-
-    it('should skip spread check when no book data available', async () => {
-      const sdk = createMockSdk();
-      const strategy = new EnhancedDipArbStrategy(sdk, makeConfig());
-      await strategy.start();
-      emitStarted(sdk);
-      // DON'T populate orderbook — no bids available
-      // Also clear asks
-      (sdk.dipArb as any).upAsks = [];
-      const leg1Events = collectEvents(strategy, 'leg1Executed');
-
-      sdk.dipArb.emit('signal', makeLeg1Signal());
-      await flush();
-      // Should pass through (no spread check when bookBid=0 or bookAsk=0)
-      expect(leg1Events).toHaveLength(1);
       await strategy.stop();
     });
 
@@ -1511,59 +1498,89 @@ describe('EnhancedDipArbStrategy', () => {
   // ── Orderbook Subscription ─────────────────────────────────────────────
 
   describe('orderbook subscription', () => {
-    it('should capture bid data from realtimeService', async () => {
+    it('should capture bid data from realtimeService bookCache', async () => {
       const { sdk, strategy } = await setupReady();
       const leg1Events = collectEvents(strategy, 'leg1Executed');
 
-      // Update bids to be very close to asks (narrow spread)
-      sdk.dipArb.realtimeService.emit('orderbook', {
-        assetId: 'up-token-123',
+      // Update bids in bookCache (strategy reads from here in price poll)
+      sdk.dipArb.realtimeService.bookCache.set('up-token-123', {
         bids: [{ price: 0.395, size: 200 }],
+        asks: [{ price: 0.40, size: 100 }],
       });
 
       sdk.dipArb.emit('signal', makeLeg1Signal());
       await flush();
 
       expect(leg1Events).toHaveLength(1);
-      // bestBid should reflect the latest orderbook data
+      // bestBid should reflect the latest bookCache data
       expect(leg1Events[0].bestBid.toNumber()).toBe(0.395);
       await strategy.stop();
     });
 
-    it('should unsubscribe on new round', async () => {
+    it('should flush stale bookCache and upAsks/downAsks on market rotation', async () => {
       const { sdk, strategy } = await setupReady();
 
-      // First round populates bids
-      sdk.dipArb.realtimeService.emit('orderbook', {
-        assetId: 'up-token-123',
-        bids: [{ price: 0.39, size: 100 }],
-      });
+      // setupReady → emitStarted (clears) → populateOrderbook (repopulates)
+      // Verify caches are populated with "old market" data
+      expect(sdk.dipArb.realtimeService.bookCache.size).toBeGreaterThan(0);
+      expect(sdk.dipArb.upAsks.length).toBeGreaterThan(0);
+      expect(sdk.dipArb.downAsks.length).toBeGreaterThan(0);
 
-      // New round should clear bids
+      // Rotate to a new market — handleStarted should clear stale caches
       emitStarted(sdk, {
         slug: 'new-round',
         upTokenId: 'new-up-token',
         downTokenId: 'new-down-token',
       });
 
-      // Old orderbook data should be cleared
-      // New orderbook data for old token should be ignored
-      sdk.dipArb.realtimeService.emit('orderbook', {
-        assetId: 'up-token-123', // old token
-        bids: [{ price: 0.50, size: 100 }],
+      // bookCache should be cleared (no stale resolved prices)
+      expect(sdk.dipArb.realtimeService.bookCache.size).toBe(0);
+      // SDK ask arrays should be cleared (no stale asks)
+      expect(sdk.dipArb.upAsks).toEqual([]);
+      expect(sdk.dipArb.downAsks).toEqual([]);
+
+      await strategy.stop();
+    });
+
+    it('should fetch orderbook via REST when WebSocket data is missing', { timeout: 10000 }, async () => {
+      const sdk = createMockSdk();
+      const config = makeConfig();
+      const strategy = new EnhancedDipArbStrategy(sdk, config);
+      await strategy.start();
+
+      // Emit started with token IDs but do NOT populate orderbook data
+      // (simulates WebSocket subscription not delivering data)
+      emitStarted(sdk);
+      // handleStarted clears caches; don't repopulate — simulate WS failure
+
+      // Configure REST mock to return fresh data for the new tokens
+      sdk.markets.getTokenOrderbook.mockImplementation((tokenId: string) => {
+        if (tokenId === 'up-token-123') {
+          return Promise.resolve({
+            bids: [{ price: 0.42, size: 200 }],
+            asks: [{ price: 0.43, size: 150 }],
+          });
+        }
+        if (tokenId === 'down-token-456') {
+          return Promise.resolve({
+            bids: [{ price: 0.52, size: 200 }],
+            asks: [{ price: 0.53, size: 150 }],
+          });
+        }
+        return Promise.resolve(null);
       });
 
-      // Signal with new token — bestBid should be undefined (old token data ignored)
-      const leg1Events = collectEvents(strategy, 'leg1Executed');
-      sdk.dipArb.emit('signal', makeLeg1Signal({
-        tokenId: 'new-up-token',
-      }));
-      await flush();
+      // Wait for the 5s REST poll timer to fire + buffer for async REST fetch
+      await new Promise(r => setTimeout(r, 5500));
 
-      if (leg1Events.length > 0) {
-        // bestBid should NOT be 0.50 (that was for the old token)
-        expect(leg1Events[0].bestBid?.toNumber()).not.toBe(0.50);
-      }
+      // REST should have been called for both tokens
+      expect(sdk.markets.getTokenOrderbook).toHaveBeenCalledWith('up-token-123');
+      expect(sdk.markets.getTokenOrderbook).toHaveBeenCalledWith('down-token-456');
+
+      // SDK caches should now be populated from REST data
+      expect(sdk.dipArb.upAsks).toEqual([{ price: 0.43, size: 150 }]);
+      expect(sdk.dipArb.downAsks).toEqual([{ price: 0.53, size: 150 }]);
+
       await strategy.stop();
     });
   });

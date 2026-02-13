@@ -43,6 +43,13 @@ export function useMarketData(strategy: EnhancedDipArbStrategy): MarketData {
       // Compute market end time from the event so the countdown is always derived from Date.now()
       marketEndMsRef.current = Date.now() + data.secondsRemaining * 1000;
       setSecondsRemaining(data.secondsRemaining);
+      // Reset prices so TUI shows "-.--" instead of stale data from the
+      // previous resolved market. Fresh data will arrive once the SDK's
+      // WebSocket subscription populates the new tokens.
+      setUpAsk({ price: null, size: 0 });
+      setUpBid({ price: null, size: 0 });
+      setDownAsk({ price: null, size: 0 });
+      setDownBid({ price: null, size: 0 });
     };
 
     strategy.on('priceUpdate', handlePrice);
