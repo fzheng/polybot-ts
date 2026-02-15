@@ -322,6 +322,26 @@ describe('EnhancedDipArbStrategy', () => {
       await strategy.stop();
     });
 
+    it('should reset SDK signal phase on market start', async () => {
+      const { sdk, strategy } = await setupReady();
+
+      // Simulate stale SDK internal state from a previous cycle.
+      (sdk.dipArb as any).currentRound = {
+        phase: 'leg1_filled',
+        leg1: { side: 'UP', price: 0.4, shares: 10, tokenId: 'up-token-123' },
+        leg2: { side: 'DOWN', price: 0.5, shares: 10, tokenId: 'down-token-456' },
+      };
+      (sdk.dipArb as any).leg1SignalEmitted = true;
+
+      emitStarted(sdk, { slug: 'rotation-round' });
+
+      expect((sdk.dipArb as any).currentRound.phase).toBe('waiting');
+      expect((sdk.dipArb as any).currentRound.leg1).toBeUndefined();
+      expect((sdk.dipArb as any).currentRound.leg2).toBeUndefined();
+      expect((sdk.dipArb as any).leg1SignalEmitted).toBe(false);
+      await strategy.stop();
+    });
+
     it('should allow new entry after round reset', async () => {
       const { sdk, strategy } = await setupReady();
 
@@ -2161,7 +2181,7 @@ describe('EnhancedDipArbStrategy', () => {
       await strategy.stop();
     });
 
-    it('should fetch orderbook via REST when WebSocket data is missing', { timeout: 10000 }, async () => {
+    it('should fetch orderbook via REST when WebSocket data is missing', { timeout: 5000 }, async () => {
       const sdk = createMockSdk();
       const config = makeConfig();
       const strategy = new EnhancedDipArbStrategy(sdk, config);
@@ -2190,8 +2210,8 @@ describe('EnhancedDipArbStrategy', () => {
         return new Response(null, { status: 404 });
       });
 
-      // Wait for the 5s REST poll timer to fire + buffer for async REST fetch
-      await new Promise(r => setTimeout(r, 5500));
+      // Wait for immediate/1s REST fallback + async buffer
+      await new Promise(r => setTimeout(r, 1500));
 
       // fetch should have been called for both tokens
       expect(fetchSpy).toHaveBeenCalled();
@@ -2278,8 +2298,8 @@ describe('EnhancedDipArbStrategy', () => {
       await flush();
 
       // SDK phase should be reset
-      expect(sdk.dipArb.currentRound.phase).toBe('watching');
-      expect(sdk.dipArb.currentRound.leg1).toBeNull();
+      expect(sdk.dipArb.currentRound.phase).toBe('waiting');
+      expect(sdk.dipArb.currentRound.leg1).toBeUndefined();
 
       // Leg 1 signal on the new market should be accepted
       const leg1Events = collectEvents(strategy, 'leg1Executed');

@@ -81,11 +81,23 @@ export class EnhancedDipArbStrategy extends EventEmitter {
   // Continuous price feed for TUI (reads SDK orderbook state)
   private pricePollTimer: ReturnType<typeof setInterval> | null = null;
   private restPollTimer: ReturnType<typeof setInterval> | null = null;
-  private lastPollLogTime = 0;
   private pricePollTicks = 0;
   private restFetchInFlight = false;    // Prevent overlapping REST fetches
-  private lastPriceHistoryLen = 0;      // Track SDK priceHistory growth to detect live WS
+  private lastWsBookUpdateMs = 0;       // Last WS orderbook update time for current market
+  private readonly restPollIntervalMs = 500;
+  private readonly wsStaleAfterMs = 900;
+  private readonly restRequestTimeoutMs = 800;
   private _lastSignalLogTime: Map<string, number> = new Map(); // Throttle signal debug logs
+  private lastGate2RejectSecsLeft: number | null = null; // Suppress duplicate gate-2 spam logs
+  private readonly onRealtimeOrderbook = (book: any): void => {
+    const tokenId =
+      (typeof book?.tokenId === 'string' ? book.tokenId : '') ||
+      (typeof book?.assetId === 'string' ? book.assetId : '');
+    if (!tokenId) return;
+    if (tokenId === this.currentUpTokenId || tokenId === this.currentDownTokenId) {
+      this.lastWsBookUpdateMs = Date.now();
+    }
+  };
 
   // Bid data read from realtimeService.bookCache in price poll (SDK only stores asks internally)
   private upBids: Array<{ price: number; size: number }> = [];
@@ -331,6 +343,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     this.leg1 = null;
     this.leg2 = null;
     this.cycleFinalized = false;
+    this.lastGate2RejectSecsLeft = null;
     this.setState(StrategyState.WATCHING);
 
     // Calculate remaining time from market endTime (Date object)
@@ -352,13 +365,16 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     this.upBids = [];
     this.downBids = [];
 
-    // Reset SDK's internal round phase so it emits leg1 signals for the new market.
-    // Without this, notifySdkLeg1Filled() from a previous cycle leaves
-    // currentRound.phase='leg1_filled', causing the SDK to only emit leg2 signals.
+    // Reset SDK's internal signal state on market rotation.
+    // Without this, stale leg2 phase/flags can persist across markets.
     const dipArb = this.sdk.dipArb as any;
     if (dipArb.currentRound) {
-      dipArb.currentRound.phase = 'watching';
-      dipArb.currentRound.leg1 = null;
+      dipArb.currentRound.phase = 'waiting';
+      dipArb.currentRound.leg1 = undefined;
+      dipArb.currentRound.leg2 = undefined;
+    }
+    if (typeof dipArb.leg1SignalEmitted === 'boolean') {
+      dipArb.leg1SignalEmitted = false;
     }
 
     // Flush stale orderbook data left over from the previous market.
@@ -513,7 +529,11 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       const secsLeft = Math.max(0, Math.round((this.marketEndTimeMs - Date.now()) / 1000));
       const minRequired = this.config.risk.exitBeforeExpiryMinutes * 60;
       if (secsLeft <= minRequired) {
-        this.log('debug', `GATE 2 REJECT: ${secsLeft}s left < ${minRequired}s required`);
+        // Log once per second value to avoid log storms when duplicate signals fire.
+        if (this.lastGate2RejectSecsLeft !== secsLeft) {
+          this.lastGate2RejectSecsLeft = secsLeft;
+          this.log('debug', `GATE 2 REJECT: ${secsLeft}s left < ${minRequired}s required`);
+        }
         return;
       }
     }
@@ -1217,8 +1237,13 @@ export class EnhancedDipArbStrategy extends EventEmitter {
   private startPricePoll(): void {
     this.stopPricePoll();
     this.pricePollTicks = 0;
-    this.lastPollLogTime = Date.now();
-    this.lastPriceHistoryLen = (this.sdk.dipArb as any).priceHistory?.length ?? 0;
+    this.lastWsBookUpdateMs = 0;
+
+    // Track only real WebSocket orderbook updates (not REST-injected data).
+    const realtimeService = (this.sdk.dipArb as any)?.realtimeService;
+    if (typeof realtimeService?.on === 'function') {
+      realtimeService.on('orderbook', this.onRealtimeOrderbook);
+    }
 
     // Main price poll — reads from SDK caches every 500ms
     this.pricePollTimer = setInterval(() => {
@@ -1294,26 +1319,27 @@ export class EnhancedDipArbStrategy extends EventEmitter {
         downAsk, downAskSize, downBid, downBidSize,
         sum,
       });
-    }, 500);
+    }, this.restPollIntervalMs);
 
-    // REST fallback poll — runs every 5s, checks if WebSocket is alive.
-    // The SDK appends to dipArb.priceHistory on every WebSocket orderbook
-    // message. If priceHistory isn't growing, WebSocket is dead and we
-    // fetch via REST to keep prices updating.
+    // REST fallback poll — runs every 500ms when WS appears stale.
+    // We track real WS orderbook events; REST injections do not reset this clock.
     this.restPollTimer = setInterval(() => {
-      const dipArb = this.sdk.dipArb as any;
-      const currentLen = dipArb.priceHistory?.length ?? 0;
-      if (currentLen > this.lastPriceHistoryLen) {
-        // WebSocket is alive — priceHistory is growing
-        this.lastPriceHistoryLen = currentLen;
-        return;
-      }
-      this.lastPriceHistoryLen = currentLen;
+      const wsFresh = this.lastWsBookUpdateMs > 0
+        && (Date.now() - this.lastWsBookUpdateMs) < this.wsStaleAfterMs;
+      if (wsFresh) return;
       this.fetchOrderbookRest();
-    }, 5000);
+    }, this.restPollIntervalMs);
+
+    // Kick one immediate fallback fetch on market start so we do not wait
+    // a full interval after rotation when WS is stale.
+    this.fetchOrderbookRest();
   }
 
   private stopPricePoll(): void {
+    const realtimeService = (this.sdk.dipArb as any)?.realtimeService;
+    if (typeof realtimeService?.off === 'function') {
+      realtimeService.off('orderbook', this.onRealtimeOrderbook);
+    }
     if (this.pricePollTimer) {
       clearInterval(this.pricePollTimer);
       this.pricePollTimer = null;
@@ -1333,7 +1359,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       const url = `${this.config.api.clobEndpoint}/book?token_id=${tokenId}`;
       const res = await fetch(url, {
         headers: { 'Accept': 'application/json' },
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(this.restRequestTimeoutMs),
       });
       if (!res.ok) return null;
       const data = await res.json() as { bids: any[]; asks: any[] };

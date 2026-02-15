@@ -9,11 +9,11 @@ max_price_age_secs = 10         # Reject stale oracle prices
 assets = ["BTC"]                # Which coins to trade: "BTC", "ETH", "SOL", "XRP"
 duration = "15m"                # Market duration: "15m", "1h", etc.
 default_shares = 20
-default_sum_target = 0.95       # 5% min profit margin
-default_dip_threshold = 0.20    # 20% drop triggers entry
-window_minutes = 10             # Enter in first 10 min (5 min buffer before emergency exit)
+default_sum_target = 0.92       # 8% min profit margin (SDK default, improves leg2 fill rate)
+default_dip_threshold = 0.15    # 15% drop triggers entry (SDK backtested robust value)
+window_minutes = 12             # Enter in first 12 min (SDK auto-trade uses 14; Gate 2 blocks last 3 min)
 max_cycles = 1                  # Max cycles per round
-dump_window_ms = 3000           # 3-second sliding window for dump detection
+dump_window_ms = 3000           # 3-second sliding window (SDK core parameter)
 use_maker_orders = true         # Use GTC limit orders (maker, 0% fee)
 maker_fallback_to_taker = true  # Fall back to FOK if margin > fee
 taker_fee_rate = 0.0625         # Polymarket neg-risk fee rate (fee_rate_bps=1000)
