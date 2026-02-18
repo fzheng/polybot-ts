@@ -407,6 +407,46 @@ describe('EnhancedDipArbStrategy', () => {
       await strategy.stop();
     });
 
+    it('should skip leg1 when spread is wider than configured max', async () => {
+      const { sdk, strategy } = await setupReady({
+        trading: { ...makeConfig().trading, maxSpreadPct: 0.10 },
+      });
+      const leg1Events = collectEvents(strategy, 'leg1Executed');
+
+      // UP bid=0.39, ask=0.60 => spread ~53.8% (>10%)
+      sdk.dipArb.upAsks = [{ price: 0.60, size: 100 }];
+      sdk.dipArb.realtimeService.bookCache.set('up-token-123', {
+        bids: [{ price: 0.39, size: 100 }],
+        asks: [{ price: 0.60, size: 100 }],
+      });
+
+      sdk.dipArb.emit('signal', makeLeg1Signal({ currentPrice: 0.60, oppositeAsk: 0.30 }));
+      await flush();
+
+      expect(leg1Events).toHaveLength(0);
+      expect(strategy.getState()).toBe(StrategyState.WATCHING);
+      await strategy.stop();
+    });
+
+    it('should allow leg1 when spread is within configured max', async () => {
+      const { sdk, strategy } = await setupReady({
+        trading: { ...makeConfig().trading, maxSpreadPct: 0.10 },
+      });
+      const leg1Events = collectEvents(strategy, 'leg1Executed');
+
+      // UP bid=0.39, ask=0.40 => spread ~2.6% (<10%)
+      sdk.dipArb.realtimeService.bookCache.set('up-token-123', {
+        bids: [{ price: 0.39, size: 120 }],
+        asks: [{ price: 0.40, size: 100 }],
+      });
+
+      sdk.dipArb.emit('signal', makeLeg1Signal({ currentPrice: 0.40, oppositeAsk: 0.55 }));
+      await flush();
+
+      expect(leg1Events).toHaveLength(1);
+      await strategy.stop();
+    });
+
     it('should enforce one entry per market', async () => {
       const { sdk, strategy } = await setupReady();
       const leg1Events = collectEvents(strategy, 'leg1Executed');
@@ -1856,14 +1896,15 @@ describe('EnhancedDipArbStrategy', () => {
     });
   });
 
-  // ── Fix #7: Payout uses min(leg1, leg2) shares for partial fills ──────
+  // ── Fix #7: Partial leg2 fill safety ───────────────────────────────────
 
-  describe('fix #7 — payout uses min shares for partial fills', () => {
-    it('should use leg2 shares when less than leg1 (partial fill)', async () => {
+  describe('fix #7 — partial leg2 fill safety', () => {
+    it('should emergency-exit instead of marking cycle completed on partial leg2 fill', async () => {
       const { sdk, strategy } = await setupReady({
         paper: { enabled: false, startingBalance: 1000, simulateFees: true, simulateSlippage: true, slippagePct: 0.02, logFile: 'test.jsonl', recordData: false, dataDir: 'data', recordIntervalMs: 1000 },
       });
       const cycles = collectEvents(strategy, 'cycleComplete');
+      const emergencyEvents = collectEvents(strategy, 'emergencyExit');
 
       const leg1Id = 'pf-leg1';
       const leg2Id = 'pf-leg2';
@@ -1884,13 +1925,18 @@ describe('EnhancedDipArbStrategy', () => {
       });
       await flush();
 
+      // Partial leg2 should trigger emergency path, not completed-cycle accounting.
       expect(cycles).toHaveLength(1);
-      // payout = min(100, 60) = 60 (not 100)
-      // totalCost = 0.40*100 + 0.50*60 = 40 + 30 = 70
-      // profit = 60 - 70 = -10
-      expect(cycles[0].payout.toNumber()).toBe(60);
-      expect(cycles[0].totalCost.toNumber()).toBe(70);
-      expect(cycles[0].profit.toNumber()).toBe(-10);
+      expect(emergencyEvents).toHaveLength(1);
+      expect(cycles[0].status).toBe('emergency_exit');
+      expect(strategy.getStats().cyclesCompleted).toBe(0);
+      expect(strategy.getStats().cyclesAbandoned).toBe(1);
+      expect(sdk.tradingService.createMarketOrder).toHaveBeenCalledWith(
+        expect.objectContaining({ side: 'SELL', tokenId: 'down-token-456' }),
+      );
+      expect(sdk.tradingService.createMarketOrder).toHaveBeenCalledWith(
+        expect.objectContaining({ side: 'SELL', tokenId: 'up-token-123' }),
+      );
       await strategy.stop();
     });
 
@@ -1991,6 +2037,30 @@ describe('EnhancedDipArbStrategy', () => {
 
       expect(leg1Events).toHaveLength(1);
       expect(leg1Events[0].shares.toNumber()).toBe(67);
+      await strategy.stop();
+    });
+
+    it('should update live balance to zero (no stale previous balance)', async () => {
+      const sdk = createMockSdk();
+      sdk.tradingService.getBalanceAllowance = vi.fn().mockResolvedValue({
+        balance: '0',
+        allowance: '10000',
+      });
+      const config = makeConfig({
+        paper: { enabled: false, startingBalance: 1000, simulateFees: true, simulateSlippage: true, slippagePct: 0.02, logFile: 'test.jsonl', recordData: false, dataDir: 'data', recordIntervalMs: 1000 },
+        trading: { ...makeConfig().trading, useMakerOrders: false, makerFallbackToTaker: true },
+      });
+      const strategy = new EnhancedDipArbStrategy(sdk, config);
+      await strategy.start();
+      emitStarted(sdk);
+      populateOrderbook(sdk);
+
+      const leg1Events = collectEvents(strategy, 'leg1Executed');
+      sdk.dipArb.emit('signal', makeLeg1Signal({ currentPrice: 0.40 }));
+      await flush();
+
+      expect(leg1Events).toHaveLength(0);
+      expect(sdk.tradingService.createMarketOrder).not.toHaveBeenCalled();
       await strategy.stop();
     });
 
@@ -2187,11 +2257,6 @@ describe('EnhancedDipArbStrategy', () => {
       const strategy = new EnhancedDipArbStrategy(sdk, config);
       await strategy.start();
 
-      // Emit started with token IDs but do NOT populate orderbook data
-      // (simulates WebSocket subscription not delivering data)
-      emitStarted(sdk);
-      // handleStarted clears caches; don't repopulate — simulate WS failure
-
       // Mock global fetch to return orderbook data for our token IDs
       const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
         const url = typeof input === 'string' ? input : input.url;
@@ -2210,8 +2275,13 @@ describe('EnhancedDipArbStrategy', () => {
         return new Response(null, { status: 404 });
       });
 
-      // Wait for immediate/1s REST fallback + async buffer
-      await new Promise(r => setTimeout(r, 1500));
+      // Emit started with token IDs but do NOT populate orderbook data
+      // (simulates WebSocket subscription not delivering data)
+      emitStarted(sdk);
+      // handleStarted clears caches; don't repopulate — simulate WS failure
+
+      // Wait for immediate fetch + async processing.
+      await new Promise(r => setTimeout(r, 800));
 
       // fetch should have been called for both tokens
       expect(fetchSpy).toHaveBeenCalled();

@@ -70,5 +70,6 @@ coverage/
 # Misc
 *.tgz
 *.gz
+*tmp_old.txt
 
 nul

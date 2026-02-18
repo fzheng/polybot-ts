@@ -84,9 +84,10 @@ export class EnhancedDipArbStrategy extends EventEmitter {
   private pricePollTicks = 0;
   private restFetchInFlight = false;    // Prevent overlapping REST fetches
   private lastWsBookUpdateMs = 0;       // Last WS orderbook update time for current market
-  private readonly restPollIntervalMs = 500;
-  private readonly wsStaleAfterMs = 900;
-  private readonly restRequestTimeoutMs = 800;
+  private readonly pricePollIntervalMs = 500;   // Keep UI/orderbook updates fast
+  private readonly restPollIntervalMs = 2500;   // REST fallback must be slower than WS path
+  private readonly wsStaleAfterMs = 6000;       // Consider WS stale only after prolonged silence
+  private readonly restRequestTimeoutMs = 1200;
   private _lastSignalLogTime: Map<string, number> = new Map(); // Throttle signal debug logs
   private lastGate2RejectSecsLeft: number | null = null; // Suppress duplicate gate-2 spam logs
   private readonly onRealtimeOrderbook = (book: any): void => {
@@ -162,8 +163,14 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       autoMerge: true,
       autoExecute: false, // We control execution; explicit settlement in handleRoundComplete + autoSettle as fallback
       debug: false,
+      logHandler: (msg: string) => this.log('debug', msg),
     };
     this.sdk.dipArb.updateConfig(dipConfig);
+    this.log('info',
+      `SDK config: dipThreshold=${dipConfig.dipThreshold}, sumTarget=${dipConfig.sumTarget}, ` +
+      `windowMinutes=${dipConfig.windowMinutes}, slidingWindowMs=${dipConfig.slidingWindowMs}, ` +
+      `enableSurge=${dipConfig.enableSurge}, leg2Timeout=${dipConfig.leg2TimeoutSeconds}s`,
+    );
 
     // Wire up SDK events once per strategy lifecycle.
     this.attachSdkListeners();
@@ -367,9 +374,12 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
     // Reset SDK's internal signal state on market rotation.
     // Without this, stale leg2 phase/flags can persist across markets.
+    // CRITICAL: startTime must be reset — detectLeg1Signal() uses it to check
+    // if elapsed > windowMinutes, and will silently drop ALL signals if stale.
     const dipArb = this.sdk.dipArb as any;
     if (dipArb.currentRound) {
       dipArb.currentRound.phase = 'waiting';
+      dipArb.currentRound.startTime = Date.now();
       dipArb.currentRound.leg1 = undefined;
       dipArb.currentRound.leg2 = undefined;
     }
@@ -394,9 +404,12 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     // subscription) — no separate orderbook subscription needed.
     this.startPricePoll();
 
+    // Log SDK internal state for debugging
+    const sdkRound = dipArb.currentRound;
     this.log('info',
       `New market: ${slug} — https://polymarket.com/event/${slug} ` +
-      `(UP=${this.currentUpTokenId?.slice(-8) ?? 'none'}, DOWN=${this.currentDownTokenId?.slice(-8) ?? 'none'})`,
+      `(UP=${this.currentUpTokenId?.slice(-8) ?? 'none'}, DOWN=${this.currentDownTokenId?.slice(-8) ?? 'none'}) ` +
+      `SDK phase=${sdkRound?.phase ?? 'none'}, priceHistory=${dipArb.priceHistory?.length ?? 0}`,
     );
   }
 
@@ -463,19 +476,13 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       this.lastSecondsRemaining = secondsRemaining;
     }
 
-    // Log every signal received from the SDK (throttled: once per 30s per type)
-    const sigKey = `${signal.type}_${signal.source ?? 'dip'}`;
-    const now = Date.now();
-    if (!this._lastSignalLogTime) this._lastSignalLogTime = new Map();
-    const lastLog = this._lastSignalLogTime.get(sigKey) ?? 0;
-    if (now - lastLog > 30_000) {
-      this._lastSignalLogTime.set(sigKey, now);
-      this.log('debug',
-        `SIGNAL: type=${signal.type} source=${signal.source ?? 'dip'} ` +
-        `side=${signal.dipSide} price=$${Number(signal.currentPrice).toFixed(4)} ` +
-        `drop=${((signal.dropPercent ?? 0) * 100).toFixed(1)}% state=${this.state}`,
-      );
-    }
+    // Log every signal received from the SDK (no throttle — debug mode)
+    this.log('info',
+      `SIGNAL: type=${signal.type} source=${signal.source ?? 'dip'} ` +
+      `side=${signal.dipSide} price=$${Number(signal.currentPrice).toFixed(4)} ` +
+      `opposite=$${Number(signal.oppositeAsk ?? 0).toFixed(4)} ` +
+      `drop=${((signal.dropPercent ?? 0) * 100).toFixed(1)}% state=${this.state}`,
+    );
 
     // Only handle Leg 1 signals when we're watching
     if (signal.type === 'leg1') {
@@ -513,12 +520,14 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
   private async handleLeg1Signal(signal: any): Promise<void> {
     if (this.state !== StrategyState.WATCHING) {
-      return; // Already in a cycle (including LEG1_PENDING, LEG2_PENDING, LIQUIDATING)
+      this.log('info', `GATE 0 REJECT: state=${this.state} (not WATCHING)`);
+      return;
     }
 
     // ── Gate 1: One entry per market ─────────────────────────────────
     if (this.cycleAttemptedThisRound) {
-      return; // Already entered (or exited) this market — no re-entry
+      this.log('info', `GATE 1 REJECT: cycleAttemptedThisRound=true`);
+      return;
     }
 
     // ── Gate 2: Time remaining — don't enter near expiry ───────────
@@ -554,14 +563,38 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       return;
     }
 
-    // ── Gate 5: Circuit breaker ────────────────────────────────────
+    // ── Gate 5: Spread width check ─────────────────────────────────
+    // Skip entries in thin books even when dip signal fires. This uses
+    // live top-of-book data (bid from cache + ask from SDK).
+    {
+      const leg1Bids = this.getBids(side);
+      const dipArbRef = this.sdk.dipArb as any;
+      const leg1Asks = side === Side.UP ? dipArbRef.upAsks : dipArbRef.downAsks;
+      const bookBid = leg1Bids[0]?.price ?? 0;
+      const bookAsk = leg1Asks?.[0]?.price ? Number(leg1Asks[0].price) : 0;
+
+      if (bookBid > 0 && bookAsk > 0) {
+        const spreadPct = (bookAsk - bookBid) / bookBid;
+        if (spreadPct > this.config.trading.maxSpreadPct) {
+          this.log(
+            'warn',
+            `SPREAD SKIP: ${(spreadPct * 100).toFixed(1)}% ` +
+            `(bid=$${bookBid.toFixed(4)}, ask=$${bookAsk.toFixed(4)}) > ` +
+            `max ${(this.config.trading.maxSpreadPct * 100).toFixed(1)}%`,
+          );
+          return;
+        }
+      }
+    }
+
+    // ── Gate 6: Circuit breaker ────────────────────────────────────
     if (this.positionSizer.isTradingPaused()) {
       const reason = this.positionSizer.getPauseReason();
       this.log('warn', `CIRCUIT BREAKER: ${reason}`);
       return;
     }
 
-    // ── Gate 6: Position sizing ────────────────────────────────────
+    // ── Gate 7: Position sizing ────────────────────────────────────
     const shares = this.positionSizer.calculateShares(
       this.currentBalance,
       currentPrice.toNumber(),
@@ -571,7 +604,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       return;
     }
 
-    // ── Gate 7: Fee-aware order type ────────────────────────────────
+    // ── Gate 8: Fee-aware order type ────────────────────────────────
     const orderType = this.orderPlacer.decideLeg1OrderType(
       currentPrice.toNumber(),
       oppositeAsk.toNumber(),
@@ -627,6 +660,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
   private async handleLeg2Signal(signal: any): Promise<void> {
     if (this.state !== StrategyState.WAITING_FOR_HEDGE || !this.leg1) {
+      this.log('info', `LEG2 REJECT: state=${this.state} leg1=${!!this.leg1}`);
       return;
     }
 
@@ -636,7 +670,8 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
     const sum = leg1Price.plus(oppositeAsk);
     if (sum.greaterThan(new Decimal(sumTarget))) {
-      return; // Not profitable enough yet
+      this.log('info', `LEG2 SUM REJECT: sum=$${sum.toFixed(4)} > target=$${sumTarget.toFixed(4)} (leg1=$${leg1Price.toFixed(4)}, opposite=$${oppositeAsk.toFixed(4)})`);
+      return;
     }
 
     // Leg 2 is always GTC (maker)
@@ -768,6 +803,11 @@ export class EnhancedDipArbStrategy extends EventEmitter {
         orderType: 'GTC',
         orderId: resultOrderId,
       };
+      if (this.leg1 && !leg2.shares.eq(this.leg1.shares)) {
+        void this.handlePartialLeg2Fill(leg2, 'execution');
+        return;
+      }
+
       this.leg2 = leg2;
       this.setState(StrategyState.COMPLETED);
       this.emit('leg2Executed', leg2);
@@ -779,17 +819,67 @@ export class EnhancedDipArbStrategy extends EventEmitter {
   }
 
   /**
+   * A partial leg2 fill leaves directional exposure unmatched.
+   * Unwind the partial hedge if possible, then emergency-exit leg1.
+   */
+  private async handlePartialLeg2Fill(
+    leg2: LegInfo,
+    source: 'execution' | 'poll',
+  ): Promise<void> {
+    if (!this.leg1) return;
+
+    this.pendingLeg2OrderId = null;
+    this.leg2 = leg2;
+    this.emit('leg2Executed', leg2);
+    this.log(
+      'warn',
+      `LEG 2 PARTIAL (${source}): leg1=${this.leg1.shares.toFixed(4)} vs leg2=${leg2.shares.toFixed(4)} ` +
+      `— unwinding hedge and emergency exiting leg1`,
+    );
+
+    if (!this.config.paper.enabled) {
+      const bidPrice = leg2.bestBid?.toNumber() ?? this.getBids(leg2.side)[0]?.price ?? leg2.price.toNumber();
+      const unwindPrice = this.isValidPrice(bidPrice)
+        ? bidPrice
+        : (this.isValidPrice(leg2.price.toNumber()) ? leg2.price.toNumber() : 0.5);
+
+      try {
+        await this.sdk.tradingService.createMarketOrder({
+          tokenId: leg2.tokenId,
+          side: 'SELL',
+          amount: leg2.shares.toNumber() * unwindPrice,
+          price: unwindPrice,
+          orderType: 'FOK',
+        });
+        this.log('warn', `Unwound partial leg2: ${leg2.shares.toFixed(4)} @ $${unwindPrice.toFixed(4)}`);
+      } catch (err) {
+        this.log('error', `Failed to unwind partial leg2: ${err}`);
+      }
+    }
+
+    await this.performEmergencyExit(
+      `Leg 2 partial fill (${source}): ${leg2.shares.toFixed(4)}/${this.leg1.shares.toFixed(4)} shares`,
+    );
+  }
+
+  /**
    * Finalize a live cycle after leg2 fills — calculate P&L, update stats, emit cycleComplete.
    * Idempotent: both handleExecution() and onGtcFilled() may fire for the same fill.
    */
   private finalizeLiveCycle(leg2Info: LegInfo): void {
     if (this.cycleFinalized || !this.leg1) return;
+    if (!leg2Info.shares.eq(this.leg1.shares)) {
+      this.log(
+        'error',
+        `Refusing finalize on mismatched legs: leg1=${this.leg1.shares.toFixed(4)} leg2=${leg2Info.shares.toFixed(4)}`,
+      );
+      return;
+    }
     this.cycleFinalized = true;
 
     const totalCost = this.leg1.price.times(this.leg1.shares)
       .plus(leg2Info.price.times(leg2Info.shares));
-    const matchedShares = Decimal.min(this.leg1.shares, leg2Info.shares); // Partial fills: payout on matched pairs only
-    const payout = matchedShares; // $1 per matched share pair
+    const payout = this.leg1.shares; // $1 per fully matched share pair
     const profit = payout.minus(totalCost);
 
     const result: CycleResult = {
@@ -1181,7 +1271,6 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       // Leg 2 filled — NOW clear emergency timer (Issue 4)
       this.pendingLeg2OrderId = null;
       this.clearEmergencyTimer();
-      this.setState(StrategyState.COMPLETED);
       const leg2Info: LegInfo = {
         side: details.side,
         price: new Decimal(details.price),
@@ -1191,7 +1280,13 @@ export class EnhancedDipArbStrategy extends EventEmitter {
         orderType: 'GTC',
         orderId,
       };
+      if (this.leg1 && !leg2Info.shares.eq(this.leg1.shares)) {
+        void this.handlePartialLeg2Fill(leg2Info, 'poll');
+        return;
+      }
+
       this.leg2 = leg2Info;
+      this.setState(StrategyState.COMPLETED);
       this.emit('leg2Executed', leg2Info);
       this.finalizeLiveCycle(leg2Info);
       this.placeExitSell(leg2Info, 2).then(() => this.resetCycle()).catch(err => {
@@ -1291,6 +1386,23 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
       this.pricePollTicks++;
 
+      // Periodic SDK diagnostics — every 60 ticks (~30s at 500ms interval)
+      if (this.pricePollTicks % 60 === 1) {
+        const sdkRound = dipArb.currentRound;
+        const sdkPhase = sdkRound?.phase ?? 'none';
+        const sdkHistLen = sdkHistory?.length ?? 0;
+        const elapsed = sdkRound?.startTime
+          ? ((now - sdkRound.startTime) / 60000).toFixed(1)
+          : '?';
+        const windowMin = dipArb.config?.windowMinutes ?? '?';
+        this.log('info',
+          `[SDK DIAG] phase=${sdkPhase} elapsed=${elapsed}min windowMinutes=${windowMin} ` +
+          `priceHistory=${sdkHistLen} upAsks=${dipArb.upAsks?.length ?? 0} downAsks=${dipArb.downAsks?.length ?? 0} ` +
+          `upAsk=${Number(upAsk).toFixed(4)} downAsk=${Number(downAsk).toFixed(4)} sum=${(Number(upAsk) + Number(downAsk)).toFixed(4)} ` +
+          `state=${this.state} cycleAttempted=${this.cycleAttemptedThisRound}`,
+        );
+      }
+
       // Both sides must have ask data
       if (upAsk <= 0 || downAsk <= 0) return;
 
@@ -1319,9 +1431,9 @@ export class EnhancedDipArbStrategy extends EventEmitter {
         downAsk, downAskSize, downBid, downBidSize,
         sum,
       });
-    }, this.restPollIntervalMs);
+    }, this.pricePollIntervalMs);
 
-    // REST fallback poll — runs every 500ms when WS appears stale.
+    // REST fallback poll — runs slower than the UI poll when WS appears stale.
     // We track real WS orderbook events; REST injections do not reset this clock.
     this.restPollTimer = setInterval(() => {
       const wsFresh = this.lastWsBookUpdateMs > 0
@@ -1364,18 +1476,21 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       if (!res.ok) return null;
       const data = await res.json() as { bids: any[]; asks: any[] };
 
-      // CLOB REST returns bids ascending (worst first) and asks descending
-      // (worst first). Sort so index [0] = best price for both:
+      // CLOB REST returns prices/sizes as strings — SDK expects numbers
+      // (its debug logging calls .toFixed() which throws on strings).
+      // Convert to numbers and sort so index [0] = best price for both:
       //   bids: descending (highest/best first)
       //   asks: ascending  (lowest/best first)
-      if (data.bids?.length > 1) {
-        data.bids.sort((a: any, b: any) => Number(b.price) - Number(a.price));
-      }
-      if (data.asks?.length > 1) {
-        data.asks.sort((a: any, b: any) => Number(a.price) - Number(b.price));
-      }
+      const toNumeric = (entry: any) => ({
+        price: Number(entry.price),
+        size: Number(entry.size),
+      });
+      const bids = (data.bids ?? []).map(toNumeric);
+      const asks = (data.asks ?? []).map(toNumeric);
+      bids.sort((a, b) => b.price - a.price);
+      asks.sort((a, b) => a.price - b.price);
 
-      return data;
+      return { bids, asks };
     } catch {
       return null;
     }
@@ -1427,10 +1542,13 @@ export class EnhancedDipArbStrategy extends EventEmitter {
         }
       }
 
-      // Log first successful REST fetch per round for debugging
-      if ((upBook?.asks?.length || downBook?.asks?.length) && this.pricePollTicks < 20) {
-        this.log('debug',
-          `REST fetch: UP=${upBook?.asks?.length ?? 0} asks, DOWN=${downBook?.asks?.length ?? 0} asks`,
+      // Log REST fetch with prices (every 60 ticks ~30s for debugging)
+      if ((upBook?.asks?.length || downBook?.asks?.length) && (this.pricePollTicks < 20 || this.pricePollTicks % 60 === 0)) {
+        const upBest = upBook?.asks?.[0]?.price ?? '?';
+        const downBest = downBook?.asks?.[0]?.price ?? '?';
+        this.log('info',
+          `REST fetch: UP=${upBook?.asks?.length ?? 0} asks (best=${upBest}), ` +
+          `DOWN=${downBook?.asks?.length ?? 0} asks (best=${downBest})`,
         );
       }
     } catch {
@@ -1755,10 +1873,12 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     try {
       const result = await this.sdk.tradingService.getBalanceAllowance('COLLATERAL');
       const balance = Number(result.balance);
-      if (balance > 0) {
-        this.currentBalance = balance;
-        this.log('info', `Live balance: $${balance.toFixed(2)}`);
+      if (!Number.isFinite(balance) || balance < 0) {
+        this.log('warn', `Received invalid live balance: ${String(result.balance)}`);
+        return;
       }
+      this.currentBalance = balance;
+      this.log('info', `Live balance: $${balance.toFixed(2)}`);
     } catch (err) {
       this.log('warn', `Failed to query live balance: ${err}`);
     }

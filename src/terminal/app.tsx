@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { Box, Text, useInput, useApp } from 'ink';
+import React, { useState, useCallback } from 'react';
+import { Box, Text, useApp } from 'ink';
 import TextInput from 'ink-text-input';
 import { PricePanel } from './components/PricePanel.js';
 import { PositionsPanel } from './components/PositionsPanel.js';
@@ -19,21 +19,31 @@ interface AppProps {
   paperTrader: PaperTrader | null;
 }
 
+interface AppMessage {
+  message: string;
+  timestamp: Date;
+  level: 'info' | 'warn' | 'error';
+}
+
+function makeMessage(message: string, level: AppMessage['level'] = 'info'): AppMessage {
+  return { message, timestamp: new Date(), level };
+}
+
 export const App: React.FC<AppProps> = ({ config, strategy, paperTrader }) => {
   const { exit } = useApp();
   const [input, setInput] = useState('');
-  const [messages, setMessages] = useState<string[]>([
-    'PolyBot v2.0 (TypeScript + poly-sdk)',
-    config.paper.enabled ? `PAPER MODE — Balance: $${config.paper.startingBalance}` : 'LIVE MODE',
-    'Type "help" for commands',
+  const [messages, setMessages] = useState<AppMessage[]>([
+    makeMessage('PolyBot v2.0 (TypeScript + poly-sdk)'),
+    makeMessage(config.paper.enabled ? `PAPER MODE - Balance: $${config.paper.startingBalance}` : 'LIVE MODE'),
+    makeMessage('Type "help" for commands'),
   ]);
 
   const market = useMarketData(strategy);
   const strat = useStrategyState(strategy);
   const paper = usePaperTrading(paperTrader);
 
-  const addMessage = useCallback((msg: string) => {
-    setMessages(prev => [...prev.slice(-49), msg]);
+  const addMessage = useCallback((message: string, level: AppMessage['level'] = 'info') => {
+    setMessages(prev => [...prev.slice(-49), makeMessage(message, level)]);
   }, []);
 
   const handleSubmit = useCallback((cmd: string) => {
@@ -69,7 +79,7 @@ export const App: React.FC<AppProps> = ({ config, strategy, paperTrader }) => {
         exit();
         break;
       default:
-        if (command) addMessage(`Unknown command: ${command}`);
+        if (command) addMessage(`Unknown command: ${command}`, 'warn');
     }
     setInput('');
   }, [strat, market, paper, addMessage, exit]);
@@ -79,7 +89,7 @@ export const App: React.FC<AppProps> = ({ config, strategy, paperTrader }) => {
       {/* Header */}
       <Box borderStyle="single" borderColor="cyan" paddingX={1}>
         <Text bold color="cyan">PolyBot v2.0</Text>
-        <Text> — {config.trading.assets.join('/')} {config.trading.duration} Dip Arb with Maker Orders</Text>
+        <Text> - {config.trading.assets.join('/')} {config.trading.duration} Dip Arb with Maker Orders</Text>
       </Box>
 
       {/* Top row: Prices + Positions side-by-side */}

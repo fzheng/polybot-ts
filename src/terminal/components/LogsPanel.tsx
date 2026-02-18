@@ -9,13 +9,19 @@ interface LogEntry {
 
 interface LogsPanelProps {
   logs: LogEntry[];
-  messages: string[];
+  messages: LogEntry[];
+}
+
+function sanitizeLine(text: string): string {
+  return text
+    .replace(/\x1b\[[0-9;]*m/g, '')
+    .replace(/[^\x20-\x7E]/g, '');
 }
 
 export const LogsPanel: React.FC<LogsPanelProps> = ({ logs, messages }) => {
-  // Merge strategy logs and command messages, show most recent
+  // Merge strategy logs and command messages, show most recent.
   const combined = [
-    ...messages.map(m => ({ message: m, timestamp: new Date(), level: 'info' })),
+    ...messages,
     ...logs,
   ]
     .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
@@ -36,8 +42,8 @@ export const LogsPanel: React.FC<LogsPanelProps> = ({ logs, messages }) => {
       {combined.map((entry, i) => {
         const ts = entry.timestamp.toTimeString().slice(0, 8);
         return (
-          <Text key={i} color={levelColor(entry.level)}>
-            [{ts}] {entry.message}
+          <Text key={`${entry.timestamp.getTime()}-${i}`} color={levelColor(entry.level)}>
+            [{ts}] {sanitizeLine(entry.message)}
           </Text>
         );
       })}

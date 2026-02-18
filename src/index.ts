@@ -9,6 +9,64 @@ import { App } from './terminal/app.js';
 import { createSessionLogger, type SessionLogger } from './logging/session-logger.js';
 
 let sessionLogger: SessionLogger | null = null;
+let restoreConsole: (() => void) | null = null;
+
+function formatConsoleArgs(args: unknown[]): string {
+  return args.map((arg) => {
+    if (typeof arg === 'string') return arg;
+    if (arg instanceof Error) return arg.stack ?? arg.message;
+    try {
+      return JSON.stringify(arg);
+    } catch {
+      return String(arg);
+    }
+  }).join(' ');
+}
+
+function installTuiConsoleRedirect(logger: SessionLogger): () => void {
+  const originals = {
+    log: console.log.bind(console),
+    info: console.info.bind(console),
+    debug: console.debug.bind(console),
+    warn: console.warn.bind(console),
+    error: console.error.bind(console),
+  };
+
+  const noisyPrefixes = [
+    '[CLOB Client]',
+    '[DipArb]',
+    '[RealtimeService]',
+    '[RealTimeDataClient]',
+    '[OrderManager]',
+  ];
+
+  const isNoisy = (line: string): boolean =>
+    noisyPrefixes.some((prefix) => line.includes(prefix));
+
+  const logOnly = (level: string) => (...args: unknown[]) => {
+    logger.log(`[console:${level}] ${formatConsoleArgs(args)}`);
+  };
+
+  console.log = logOnly('log');
+  console.info = logOnly('info');
+  console.debug = logOnly('debug');
+  console.warn = logOnly('warn');
+  console.error = (...args: unknown[]) => {
+    const line = formatConsoleArgs(args);
+    logger.log(`[console:error] ${line}`);
+    if (!isNoisy(line)) {
+      originals.error(...args);
+    }
+  };
+
+  return () => {
+    console.log = originals.log;
+    console.info = originals.info;
+    console.debug = originals.debug;
+    console.warn = originals.warn;
+    console.error = originals.error;
+  };
+}
 
 async function main() {
   // ── Load config ────────────────────────────────────────────────────
@@ -18,6 +76,7 @@ async function main() {
 
   const config = loadConfig(configPath);
   sessionLogger = createSessionLogger('tui');
+  restoreConsole = installTuiConsoleRedirect(sessionLogger);
   sessionLogger.log(`Session log file: ${sessionLogger.filePath}`);
   sessionLogger.log(`Mode: ${config.paper.enabled ? 'paper' : 'live'}`);
   console.error(`Session log file: ${sessionLogger.filePath}`);
@@ -135,11 +194,13 @@ async function main() {
 
   // Cleanup
   await strategy.stop();
+  restoreConsole?.();
   await sessionLogger?.close();
   process.exit(0);
 }
 
 main().catch((err) => {
+  restoreConsole?.();
   sessionLogger?.log(`Fatal error: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
   void sessionLogger?.close();
   console.error('Fatal error:', err);
