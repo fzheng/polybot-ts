@@ -130,15 +130,15 @@ assets = ["BTC"]
 duration = "15m"
 default_shares = 20
 default_sum_target = 0.95
-default_dip_threshold = 0.20
-window_minutes = 5
+default_dip_threshold = 0.15
+window_minutes = 12
 max_cycles = 1
-dump_window_ms = 3000
+dump_window_ms = 10000
 use_maker_orders = true
 maker_fallback_to_taker = true
 taker_fee_rate = 0.0625
 max_spread_pct = 0.10
-gtc_fill_timeout_ms = 30000
+gtc_fill_timeout_ms = 90000
 gtc_poll_interval_ms = 1000
 ```
 
@@ -164,10 +164,10 @@ The bot enters **once per market** — a single Leg 1 + Leg 2 cycle per 15-minut
 | Parameter | Default | Range | Description |
 |---|---|---|---|
 | `default_sum_target` | `0.95` | 0.85–0.98 | Maximum `leg1_price + leg2_price` to accept. Lower = pickier, fewer trades, higher profit per trade. |
-| `default_dip_threshold` | `0.20` | 0.05–0.30 | Minimum % price drop in the sliding window to trigger Leg 1. `0.20` = 20% drop. Lower = more signals (noisier). |
-| `window_minutes` | `5` | 1–10 | Only enter trades in the first N minutes of a round. Lower = safer (more time for Leg 2). |
+| `default_dip_threshold` | `0.15` | 0.05–0.30 | Minimum % price drop in the sliding window to trigger Leg 1. `0.15` = 15% drop. Lower = more signals (noisier). |
+| `window_minutes` | `12` | 1–14 | Only enter trades in the first N minutes of a round. Lower = safer (more time for Leg 2). Max 14 (last min reserved for emergency exit). |
 | `max_cycles` | `1` | 1 | Reserved. One entry per market is hardcoded via `cycleAttemptedThisRound`. |
-| `dump_window_ms` | `3000` | 1000–10000 | Sliding window (ms) for dump detection. `3000` = looks at 3-second price change. Shorter = more sensitive. |
+| `dump_window_ms` | `10000` | 1000–15000 | Sliding window (ms) for dump detection. `10000` = looks at 10-second price change. Shorter = more sensitive to brief spikes. |
 | `default_shares` | `20` | — | Fallback share count. Overridden by the position sizer's dynamic calculation in practice. |
 
 ### Order Type & Fees
@@ -183,7 +183,7 @@ The bot enters **once per market** — a single Leg 1 + Leg 2 cycle per 15-minut
 
 | Parameter | Default | Description |
 |---|---|---|
-| `gtc_fill_timeout_ms` | `30000` | Cancel unfilled GTC limit orders after this many ms. `30000` = 30s. |
+| `gtc_fill_timeout_ms` | `90000` | Cancel unfilled GTC limit orders after this many ms. `90000` = 90s. |
 | `gtc_poll_interval_ms` | `1000` | Poll for GTC fill confirmation every N ms. Uses `getOrder(orderId)` with explicit status checks. |
 
 **Fill detection:** The bot polls the order's status via `getOrder()` (not `getOpenOrders()`). This gives explicit status for each outcome:
@@ -367,7 +367,7 @@ exit_before_expiry_minutes = 2
 |---|---|
 | `Cannot find module '@catalyst-team/poly-sdk'` | Run `npm install` — the SDK installs from GitHub |
 | `POLYMARKET_PRIVATE_KEY is required` | Create `.env` file from `.env.example` and add your key |
-| No signals / no trades | Market may be quiet. Lower `default_dip_threshold` to 0.15 or wait for volatile BTC movement |
+| No signals / no trades | Market may be quiet. Lower `default_dip_threshold` to 0.10 or wait for volatile BTC movement. After market rotation, signals rely on REST polling — check that the Polymarket CLOB API is reachable. |
 | Emergency exits every round | Increase `exit_before_expiry_minutes` to give more time for Leg 2, or check if `default_sum_target` is too tight (raise it) |
 | Terminal UI garbled | Use a modern terminal (Windows Terminal, not cmd.exe). Must support ANSI escape codes. |
 | Bot monitoring wrong market | This was fixed — the bot now validates that the current time falls within the market's 15-min window before subscribing |
@@ -388,15 +388,15 @@ assets = ["BTC"]
 duration = "15m"
 default_shares = 20
 default_sum_target = 0.95
-default_dip_threshold = 0.20
-window_minutes = 5
+default_dip_threshold = 0.15
+window_minutes = 12
 max_cycles = 1
-dump_window_ms = 3000
+dump_window_ms = 10000
 use_maker_orders = true
 maker_fallback_to_taker = true
 taker_fee_rate = 0.0625
 max_spread_pct = 0.10
-gtc_fill_timeout_ms = 30000
+gtc_fill_timeout_ms = 90000
 gtc_poll_interval_ms = 1000
 
 [risk]

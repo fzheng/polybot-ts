@@ -62,7 +62,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
   private marketEndTimeMs = 0;             // Market end time for time-based exit
   private emergencyTimer: ReturnType<typeof setInterval> | null = null;
 
-  // GTC fill tracking (Issues 1, 4, 9)
+  // GTC fill tracking
   private pendingLeg1OrderId: string | null = null;
   private pendingLeg2OrderId: string | null = null;
   private fillPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -88,7 +88,6 @@ export class EnhancedDipArbStrategy extends EventEmitter {
   private readonly restPollIntervalMs = 2500;   // REST fallback must be slower than WS path
   private readonly wsStaleAfterMs = 6000;       // Consider WS stale only after prolonged silence
   private readonly restRequestTimeoutMs = 1200;
-  private _lastSignalLogTime: Map<string, number> = new Map(); // Throttle signal debug logs
   private lastGate2RejectSecsLeft: number | null = null; // Suppress duplicate gate-2 spam logs
   private readonly onRealtimeOrderbook = (book: any): void => {
     const tokenId =
@@ -476,8 +475,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
       this.lastSecondsRemaining = secondsRemaining;
     }
 
-    // Log every signal received from the SDK (no throttle — debug mode)
-    this.log('info',
+    this.log('debug',
       `SIGNAL: type=${signal.type} source=${signal.source ?? 'dip'} ` +
       `side=${signal.dipSide} price=$${Number(signal.currentPrice).toFixed(4)} ` +
       `opposite=$${Number(signal.oppositeAsk ?? 0).toFixed(4)} ` +
@@ -520,13 +518,13 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
   private async handleLeg1Signal(signal: any): Promise<void> {
     if (this.state !== StrategyState.WATCHING) {
-      this.log('info', `GATE 0 REJECT: state=${this.state} (not WATCHING)`);
+      this.log('debug', `GATE 0 REJECT: state=${this.state} (not WATCHING)`);
       return;
     }
 
     // ── Gate 1: One entry per market ─────────────────────────────────
     if (this.cycleAttemptedThisRound) {
-      this.log('info', `GATE 1 REJECT: cycleAttemptedThisRound=true`);
+      this.log('debug', `GATE 1 REJECT: cycleAttemptedThisRound=true`);
       return;
     }
 
@@ -660,7 +658,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
   private async handleLeg2Signal(signal: any): Promise<void> {
     if (this.state !== StrategyState.WAITING_FOR_HEDGE || !this.leg1) {
-      this.log('info', `LEG2 REJECT: state=${this.state} leg1=${!!this.leg1}`);
+      this.log('debug', `LEG2 REJECT: state=${this.state} leg1=${!!this.leg1}`);
       return;
     }
 
@@ -670,7 +668,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
     const sum = leg1Price.plus(oppositeAsk);
     if (sum.greaterThan(new Decimal(sumTarget))) {
-      this.log('info', `LEG2 SUM REJECT: sum=$${sum.toFixed(4)} > target=$${sumTarget.toFixed(4)} (leg1=$${leg1Price.toFixed(4)}, opposite=$${oppositeAsk.toFixed(4)})`);
+      this.log('debug', `LEG2 SUM REJECT: sum=$${sum.toFixed(4)} > target=$${sumTarget.toFixed(4)} (leg1=$${leg1Price.toFixed(4)}, opposite=$${oppositeAsk.toFixed(4)})`);
       return;
     }
 
@@ -1102,7 +1100,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
 
     this.pendingLeg2OrderId = orderId;
     this.expectedOrderIds.add(orderId);
-    // Issue 4: DO NOT clear emergency timer — it stays active until fill confirmed
+    // DO NOT clear emergency timer — it stays active until fill confirmed
     this.setState(StrategyState.LEG2_PENDING);
     this.log('info', `Leg 2 GTC limit placed @ $${limitPrice.toFixed(4)}, orderId=${orderId}, polling...`);
 
@@ -1395,7 +1393,7 @@ export class EnhancedDipArbStrategy extends EventEmitter {
           ? ((now - sdkRound.startTime) / 60000).toFixed(1)
           : '?';
         const windowMin = dipArb.config?.windowMinutes ?? '?';
-        this.log('info',
+        this.log('debug',
           `[SDK DIAG] phase=${sdkPhase} elapsed=${elapsed}min windowMinutes=${windowMin} ` +
           `priceHistory=${sdkHistLen} upAsks=${dipArb.upAsks?.length ?? 0} downAsks=${dipArb.downAsks?.length ?? 0} ` +
           `upAsk=${Number(upAsk).toFixed(4)} downAsk=${Number(downAsk).toFixed(4)} sum=${(Number(upAsk) + Number(downAsk)).toFixed(4)} ` +
@@ -1497,12 +1495,15 @@ export class EnhancedDipArbStrategy extends EventEmitter {
   }
 
   /**
-   * REST fallback — fetch orderbook via CLOB REST API when WebSocket
-   * subscription fails to deliver data after market rotation.
+   * Fetch orderbook via CLOB REST API and inject into the SDK signal pipeline.
    *
-   * Injects data into the SDK's signal pipeline via handleOrderbookUpdate()
-   * so dip detection works even when WebSocket is dead. Also updates
-   * bookCache for bid display in the TUI price poll.
+   * After market rotation the SDK's WebSocket subscription stops delivering
+   * orderbook events for the new market. This method polls REST to fill the gap,
+   * calling handleOrderbookUpdate() so dip detection continues working.
+   * It also writes into realtimeService.bookCache so bid prices appear in the TUI.
+   *
+   * CLOB REST returns prices and sizes as strings — fetchBookDirect() converts
+   * them to numbers before returning, so the SDK's .toFixed() calls don't throw.
    */
   private async fetchOrderbookRest(): Promise<void> {
     if (this.restFetchInFlight) return;
@@ -1542,11 +1543,11 @@ export class EnhancedDipArbStrategy extends EventEmitter {
         }
       }
 
-      // Log REST fetch with prices (every 60 ticks ~30s for debugging)
+      // Log REST fetch summary periodically
       if ((upBook?.asks?.length || downBook?.asks?.length) && (this.pricePollTicks < 20 || this.pricePollTicks % 60 === 0)) {
         const upBest = upBook?.asks?.[0]?.price ?? '?';
         const downBest = downBook?.asks?.[0]?.price ?? '?';
-        this.log('info',
+        this.log('debug',
           `REST fetch: UP=${upBook?.asks?.length ?? 0} asks (best=${upBest}), ` +
           `DOWN=${downBook?.asks?.length ?? 0} asks (best=${downBest})`,
         );
@@ -1838,9 +1839,11 @@ export class EnhancedDipArbStrategy extends EventEmitter {
     this.leg2SellOrderId = null;
     this.clearEmergencyTimer();
 
-    // Reset SDK's round phase so it emits leg1 signals again.
-    // Without this, notifySdkLeg1Filled() leaves phase='leg1_filled'
-    // and the SDK only emits leg2 signals for the rest of the market.
+    // Set SDK phase to 'watching' after a failed cycle.
+    // This stops the SDK from emitting any further signals (neither leg1 nor leg2)
+    // for the rest of this market — intentional, since cycleAttemptedThisRound=true
+    // already blocks re-entry. The phase resets to 'waiting' in handleStarted()
+    // when the next market begins.
     const dipArb = this.sdk.dipArb as any;
     if (dipArb.currentRound) {
       dipArb.currentRound.phase = 'watching';
